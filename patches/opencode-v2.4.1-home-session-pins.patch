@@ -1,0 +1,2538 @@
+diff --git a/packages/app/e2e/regression/home.spec.ts b/packages/app/e2e/regression/home.spec.ts
+index f52404e464..aaec6b9cc9 100644
+--- a/packages/app/e2e/regression/home.spec.ts
++++ b/packages/app/e2e/regression/home.spec.ts
+@@ -202,7 +202,7 @@ test("the session context menu renames, exports, and deletes a Home session", as
+   const box = await target.boundingBox()
+   await target.click({ button: "right", position: { x: 48, y: 12 } })
+   await expect(page).toHaveURL("/")
+-  await expect(page.getByRole("menuitem")).toHaveText(["Open", "Open in background", "Rename", "Export…", "Delete…"])
++  await expect(page.getByRole("menuitem")).toHaveText(["Open", "Open in background", "Pin", "Rename", "Export…", "Delete…"])
+   const menu = await page.locator('[data-component="menu-v2-content"]').boundingBox()
+   expect(Math.abs((menu?.x ?? 0) - (box?.x ?? 0) - 48)).toBeLessThan(4)
+ 
+@@ -252,6 +252,211 @@ test("the session context menu renames, exports, and deletes a Home session", as
+   expect(removed.requests).toHaveLength(1)
+ })
+ 
++test("pinning a Home session keeps it above Today until it is unpinned", async ({ page }) => {
++  await openHome(page)
++  const target = row(page, fixture.expected.targetTitle)
++  const pinnedHeader = page.locator('[data-component="home-session-group"][data-group-id="pinned"]')
++  // The rows of a group are the container after its header; the header itself only holds the group title.
++  const pinnedRows = page.locator('[data-component="home-session-group"][data-group-id="pinned"] + div')
++  const targetRows = page.locator('[data-component="home-session-row"]').filter({ hasText: fixture.expected.targetTitle })
++
++  await expect(target).toBeVisible()
++  await expect(pinnedHeader).toHaveCount(0)
++
++  await target.click({ button: "right" })
++  await page.getByRole("menuitem", { name: "Pin", exact: true }).click()
++
++  await expect(pinnedHeader).toBeVisible()
++  await expect(pinnedRows).toContainText(fixture.expected.targetTitle)
++  await expect(targetRows).toHaveCount(1)
++
++  await page.reload()
++  await expect(pinnedRows).toContainText(fixture.expected.targetTitle)
++  await expect(targetRows).toHaveCount(1)
++
++  await row(page, fixture.expected.targetTitle).click({ button: "right" })
++  await page.getByRole("menuitem", { name: "Unpin", exact: true }).click()
++
++  await expect(pinnedHeader).toHaveCount(0)
++  await expect(targetRows).toHaveCount(1)
++
++  await row(page, fixture.expected.targetTitle).click({ button: "right" })
++  await page.getByRole("menuitem", { name: "Pin", exact: true }).click()
++  await expect(pinnedHeader).toBeVisible()
++
++  await row(page, fixture.expected.targetTitle).click({ button: "right" })
++  await page.getByRole("menuitem", { name: "Delete…" }).click()
++  const dialog = page.getByRole("dialog")
++
++  const removed = await holdRoute(page, (url) => url.pathname.endsWith(`/session/${fixture.targetID}`), {
++    method: "DELETE",
++  })
++
++  await dialog.getByRole("button", { name: "Delete session" }).click()
++  await removed.arrived
++  removed.release()
++
++  await expect(pinnedHeader).toHaveCount(0)
++  await expect(targetRows).toHaveCount(0)
++})
++
++test("pinning survives selecting another project, and the pin is only hidden while scoped", async ({ page }) => {
++  const other = project({ id: "proj_pin_other", directory: "C:/OpenCode/pin-other", name: "Pin Other" })
++  await mockStressTimeline(page, { projects: [other], worktrees: [] })
++  await seed(page, { usedProjects: { local: [fixture.project.id, other.id] } })
++  await page.goto("/")
++
++  const pinned = page.locator('[data-component="home-session-group"][data-group-id="pinned"]')
++  await row(page, fixture.expected.targetTitle).click({ button: "right" })
++  await page.getByRole("menuitem", { name: "Pin", exact: true }).click()
++  await expect(pinned).toBeVisible()
++
++  const otherRow = page.locator('[data-component="home-project-row"]').filter({ hasText: "Pin Other" })
++  await otherRow.click()
++  await expect(otherRow).toHaveAttribute("data-selected", "")
++  await expect(pinned).toHaveCount(0)
++
++  // Deselecting the project shows the pin again: the scoped miss must never have dropped it.
++  await otherRow.click()
++  await expect(otherRow).not.toHaveAttribute("data-selected", "")
++  await expect(pinned).toBeVisible()
++})
++
++test("a pin outside the loaded session window still renders", async ({ page }) => {
++  const sessions = Array.from({ length: 70 }, (_, index) =>
++    session({
++      id: `ses_window_${String(index).padStart(2, "0")}`,
++      directory: fixture.directory,
++      projectID: fixture.project.id,
++      title: `Window row ${index}`,
++      created: T0 - index * 86_400_000,
++    }),
++  )
++
++  await mockStressTimeline(page, { sessions })
++  await seed(page, {
++    usedProjects: { local: [fixture.project.id] },
++    storage: {
++      "opencode.global.dat:home.pins": { pins: [{ server: SERVER, sessionId: "ses_window_69" }] },
++    },
++  })
++  await page.goto("/")
++
++  const pinnedRows = page.locator('[data-component="home-session-group"][data-group-id="pinned"] + div')
++  await expect(pinnedRows).toContainText("Window row 69")
++})
++
++test("Home session pins load from the server and reflect live updates from another device", async ({ page }) => {
++  const first = session({
++    id: "ses_sync_first",
++    directory: fixture.directory,
++    projectID: fixture.project.id,
++    title: "Pinned on desktop",
++    created: T0,
++  })
++
++  const second = session({
++    id: "ses_sync_second",
++    directory: fixture.directory,
++    projectID: fixture.project.id,
++    title: "Pinned from phone",
++    created: T0 - 1_000,
++  })
++
++  const server = await mockOpenCodeServer(page, {
++    directory: fixture.directory,
++    project: fixture.project,
++    provider: NO_PROVIDER,
++    sessions: [first, second],
++    homePins: [first.id],
++    pageMessages: () => ({ items: [] }),
++  })
++
++  await seed(page, { usedProjects: { local: [fixture.project.id] } })
++  await page.goto("/")
++
++  const pinnedRows = page.locator('[data-component="home-session-group"][data-group-id="pinned"] + div')
++  await expect(pinnedRows).toContainText(first.title)
++  await expect(pinnedRows).not.toContainText(second.title)
++
++  // Another connected client (e.g. phone browser) pins a second session.
++  await server.push([
++    {
++      id: "evt_remote_pin_add",
++      created: T0 + 1_000,
++      type: "server.home_pins.updated",
++      data: { pins: [first.id, second.id] },
++    },
++  ])
++  await expect(pinnedRows).toContainText(first.title)
++  await expect(pinnedRows).toContainText(second.title)
++
++  // Another client unpins all sessions.
++  await server.push([
++    {
++      id: "evt_remote_pin_clear",
++      created: T0 + 2_000,
++      type: "server.home_pins.updated",
++      data: { pins: [] },
++    },
++  ])
++  await expect(page.locator('[data-component="home-session-group"][data-group-id="pinned"]')).toHaveCount(0)
++})
++
++test("pinning and unpinning from the session header options menu updates Home", async ({ page }) => {
++  await openHome(page)
++  const target = row(page, fixture.expected.targetTitle)
++  await expect(target).toBeVisible()
++  await target.click()
++  await expect(page).toHaveURL(new RegExp(`/session/${fixture.targetID}$`))
++
++  const header = page.locator("[data-session-title]")
++  const options = header.getByRole("button", { name: "More options", exact: true })
++  await options.click()
++  await page.getByRole("menuitem", { name: "Pin", exact: true }).click()
++
++  await page.getByRole("button", { name: "Home", exact: true }).click()
++  await expect(page).toHaveURL("/")
++
++  const pinnedRows = page.locator('[data-component="home-session-group"][data-group-id="pinned"] + div')
++  await expect(pinnedRows).toContainText(fixture.expected.targetTitle)
++
++  await row(page, fixture.expected.targetTitle).click()
++  await expect(page).toHaveURL(new RegExp(`/session/${fixture.targetID}$`))
++  await options.click()
++  await page.getByRole("menuitem", { name: "Unpin", exact: true }).click()
++
++  await page.getByRole("button", { name: "Home", exact: true }).click()
++  await expect(page.locator('[data-component="home-session-group"][data-group-id="pinned"]')).toHaveCount(0)
++})
++
++test("mobile Home row options button and mobile session bar toggle pins", async ({ page }) => {
++  await page.setViewportSize({ width: 390, height: 844 })
++  await openHome(page)
++
++  const targetContainer = page
++    .locator('[data-component="home-session-row-container"]')
++    .filter({ hasText: fixture.expected.targetTitle })
++
++  await expect(targetContainer).toBeVisible()
++  await targetContainer.locator('[data-action="home-session-options"]').click()
++  await page.getByRole("menuitem", { name: "Pin", exact: true }).click()
++
++  const pinnedRows = page.locator('[data-component="home-session-group"][data-group-id="pinned"] + div')
++  await expect(pinnedRows).toContainText(fixture.expected.targetTitle)
++
++  await row(page, fixture.expected.targetTitle).click()
++  await expect(page).toHaveURL(new RegExp(`/session/${fixture.targetID}$`))
++
++  const mobilePin = page.locator('[data-slot="session-location-bar"] [data-action="mobile-session-pin"]')
++  await expect(mobilePin).toHaveAttribute("aria-pressed", "true")
++  await mobilePin.click()
++  await expect(mobilePin).toHaveAttribute("aria-pressed", "false")
++
++  await page.goto("/")
++  await expect(page.locator('[data-component="home-session-group"][data-group-id="pinned"]')).toHaveCount(0)
++})
++
+ test("Open in background and a middle click add a Home session's tab without leaving Home, and Open goes to it", async ({
+   page,
+ }) => {
+diff --git a/packages/app/e2e/utils/mock-api.ts b/packages/app/e2e/utils/mock-api.ts
+index 545f62d94a..d2b3e2b947 100644
+--- a/packages/app/e2e/utils/mock-api.ts
++++ b/packages/app/e2e/utils/mock-api.ts
+@@ -109,6 +109,11 @@ const PersistentPtyUpdate = Schema.Struct({
+ 
+ const Group = HttpApiGroup.make("mock")
+   .add(HttpApiEndpoint.get("info", "/api/info", { success: Json }))
++  .add(HttpApiEndpoint.get("homePins", "/api/home/pins", { success: Json }))
++  .add(HttpApiEndpoint.put("pinHomeSession", "/api/home/pins/:sessionID", { params: SessionParams, success: Json }))
++  .add(
++    HttpApiEndpoint.delete("unpinHomeSession", "/api/home/pins/:sessionID", { params: SessionParams, success: Json }),
++  )
+   .add(
+     HttpApiEndpoint.get("event", "/api/event", {
+       success: Schema.String.pipe(HttpApiSchema.asText({ contentType: "text/event-stream" })),
+diff --git a/packages/app/e2e/utils/mock-server.ts b/packages/app/e2e/utils/mock-server.ts
+index 3794d30fb1..edd58742bd 100644
+--- a/packages/app/e2e/utils/mock-server.ts
++++ b/packages/app/e2e/utils/mock-server.ts
+@@ -72,6 +72,8 @@ export interface MockServerConfig {
+   configEntries?: unknown[]
+   directory: string
+   project: unknown
++  // Initial Home session pins stored on the server (`/api/home/pins`).
++  homePins?: string[]
+   // Replaces the `/api/project` inventory, which defaults to `[project]`. A location inside a listed project
+   // resolves to that project; any other location resolves to `project`.
+   projects?: Resolvable<unknown[]>
+@@ -521,6 +523,7 @@ function createMockServerHandler(config: MockServerConfig, emit: (events: MockSe
+           emit,
+           mcp: new Map<string, MockMcpStatus>(),
+           attempts: new Map<string, number>(),
++          homePins: [...(config.homePins ?? [])],
+         }),
+       ),
+       Layer.provide(HttpServer.layerServices),
+@@ -620,6 +623,7 @@ function mockHandlers(
+     // MCP status overrides by `<directory>\n<server>`, and OAuth attempt creation times by attempt ID.
+     mcp: Map<string, MockMcpStatus>
+     attempts: Map<string, number>
++    homePins: string[]
+   },
+ ) {
+   const noContent = Effect.succeed(HttpApiSchema.NoContent.make())
+@@ -801,6 +805,41 @@ function mockHandlers(
+                 ? undefined
+                 : { persistentPty: state.persistentPty.capability },
+           }),
++        homePins: () => Effect.sync(() => ({ pins: [...state.homePins] })),
++        pinHomeSession: (ctx) =>
++          Effect.sync(() => {
++            if (!state.homePins.includes(ctx.params.sessionID)) {
++              state.homePins.push(ctx.params.sessionID)
++              state.emit([
++                {
++                  id: `evt_home_pins_${state.homePins.length}`,
++                  created: Date.now(),
++                  type: "server.home_pins.updated",
++                  data: { pins: [...state.homePins] },
++                },
++              ])
++            }
++
++            return { pins: [...state.homePins] }
++          }),
++        unpinHomeSession: (ctx) =>
++          Effect.sync(() => {
++            const index = state.homePins.indexOf(ctx.params.sessionID)
++
++            if (index >= 0) {
++              state.homePins.splice(index, 1)
++              state.emit([
++                {
++                  id: `evt_home_pins_${state.homePins.length}`,
++                  created: Date.now(),
++                  type: "server.home_pins.updated",
++                  data: { pins: [...state.homePins] },
++                },
++              ])
++            }
++
++            return { pins: [...state.homePins] }
++          }),
+         config: () => Effect.succeed(configEntries),
+         reference: () => Effect.succeed({ location: location(config), data: [] }),
+         // `beforeAgentsResponse` holds the Location's agent list, as a cold Location does while its plugins activate.
+diff --git a/packages/app/src/home/home.standalone.stories.tsx b/packages/app/src/home/home.standalone.stories.tsx
+index a39b8ab969..2f661c61ac 100644
+--- a/packages/app/src/home/home.standalone.stories.tsx
++++ b/packages/app/src/home/home.standalone.stories.tsx
+@@ -9,7 +9,8 @@ import { SettingsSurfaceProvider } from "@/settings/surface"
+ import type { HomeController } from "./model"
+ import { createHomeProjectsController } from "./projects/controller"
+ import { HomeView } from "./route"
+-import { groupSessions, type HomeSessionsController } from "./sessions/controller"
++import { groupSessions } from "./sessions/groups"
++import type { HomeSessionsController } from "./sessions/controller"
+ import type { HomeSessionsListView } from "./sessions/load-machine"
+ import { buildHomeSessionRecords, homeSessionLocation } from "./sessions/records"
+ import { createHomeSessionSearchController } from "./sessions/search"
+@@ -152,12 +153,15 @@ function HomeStory(props: HomeArgs) {
+     copy: { language },
+     platform: { desktop: true },
+     tab: { isOpen: () => false },
++    pins: { isPinned: () => false, toggle() {} },
+     location: { value: (record) => homeSessionLocation(record.session.location.directory, "main"), sync() {} },
+     data: {
+       listView,
+       records,
+       groups: createMemo(() => groupSessions(records(), language)),
+       searchRecords: records,
++      pinnedIds: () => [],
++      pinnedSearchRecords: records,
+       loading: () => state.scenario === "loading",
+       retry: () => setState("scenario", "populated"),
+     },
+diff --git a/packages/app/src/home/scroll.ts b/packages/app/src/home/scroll.ts
+index 545b3e7a63..ecad87f667 100644
+--- a/packages/app/src/home/scroll.ts
++++ b/packages/app/src/home/scroll.ts
+@@ -1,6 +1,6 @@
+ import { createEffect, createSignal, onCleanup, type Accessor } from "solid-js"
+ import { createStore } from "solid-js/store"
+-import type { HomeSessionGroup } from "./sessions/controller"
++import type { HomeSessionGroup } from "./sessions/groups"
+ 
+ const HOME_SESSION_HEADER_STICKY_TOP = 12
+ 
+diff --git a/packages/app/src/home/sessions/controller.tsx b/packages/app/src/home/sessions/controller.tsx
+index 2f4270332d..b1c22a3b2d 100644
+--- a/packages/app/src/home/sessions/controller.tsx
++++ b/packages/app/src/home/sessions/controller.tsx
+@@ -10,16 +10,19 @@ import {
+   createMemo,
+   createSignal,
+   type JSX,
++  on,
+   onCleanup,
+   startTransition,
+   untrack,
+ } from "solid-js"
++import { createStore, reconcile } from "solid-js/store"
+ import { notifySessionTabsRemoved } from "@/shell/titlebar/session-events"
+ import { useCommand } from "@/shell/commands/command"
+ import { HOME_SESSION_LIMIT, mergeHomeSessionIndex, retainHomeSessions } from "@/home/sessions/index"
+ import { useLanguage } from "@/runtime/i18n/language"
+ import { ServerConnection } from "@/runtime/server/registry"
+ import { useGlobal } from "@/runtime/server/runtime"
++import type { ServerCtx } from "@/runtime/server/runtime"
+ import { sessionHasOpenTab, useTabs } from "@/shell/tabs/tabs"
+ import { errorMessage } from "@/shell/layout/helpers"
+ import { useSessionTabAvatarState } from "@/shell/layout/project-avatar-state"
+@@ -39,7 +42,10 @@ import { sessionLabel, sessionTitle } from "@/session/title"
+ import { showToast } from "@/shell/notifications/toast"
+ import { archiveHomeSession } from "./archive"
+ import { homeSessionsQuery, lookupHomeSession, projectSessionDirectories, projectSessionsQuery } from "./queries"
++import { pinKey } from "./pins"
++import { pinLookupDecision } from "./pin-lookup"
+ import {
++  HOME_SESSIONS_FETCH_TIMEOUT_MS,
+   HOME_SESSIONS_STALE_MS,
+   INITIAL_HOME_SESSIONS_LOAD_STATE,
+   selectHomeSessionsListView,
+@@ -51,16 +57,11 @@ import {
+   type HomeSessionsTimer,
+ } from "./load-machine"
+ import type { HomeController } from "../model"
++import { groupSessions } from "./groups"
+ import { buildHomeSessionRecords, homeProjectForSession, homeSessionLocation, type HomeSessionRecord } from "./records"
+ 
+ export type { HomeSessionRecord } from "./records"
+ 
+-export type HomeSessionGroup = {
+-  id: "today" | "yesterday" | "older"
+-  title: string
+-  sessions: HomeSessionRecord[]
+-}
+-
+ export type OpenSessionOptions = { background?: boolean }
+ 
+ export function createHomeSessionsController(home: HomeController) {
+@@ -72,6 +73,21 @@ export function createHomeSessionsController(home: HomeController) {
+   const queryClient = useQueryClient()
+   const global = useGlobal()
+ 
++  const pinServer = createMemo(() => {
++    const conn = home.server.focused()
++
++    return conn ? ServerConnection.key(conn) : undefined
++  })
++
++  const pinnedIds = createMemo(() => {
++    const ctx = home.server.focusedContext()
++
++    if (ctx) return ctx.homePins.ids()
++    const server = pinServer()
++
++    return server ? global.homePins.ids(server) : []
++  })
++
+   const projectDirectories = createMemo(() => {
+     const selected = home.selection.value().directory
+ 
+@@ -260,7 +276,138 @@ export function createHomeSessionsController(home: HomeController) {
+   )
+ 
+   const records = createMemo(() => allRecords().slice(0, HOME_SESSION_LIMIT))
+-  const groups = createMemo(() => groupSessions(records(), language))
++
++  const [lookupCache, setLookupCache] = createStore<Record<string, HomeSessionRecord | undefined>>({})
++  // Pins the lookup already answered for this server, so a list change does not ask again.
++  const resolvedPins = new Set<string>()
++  const inflightPins = new Set<string>()
++  const known = createMemo(() => new Map(allRecords().map((record) => [record.session.id, record])))
++
++  const recordFor = (session: SessionInfo, ctx: ServerCtx, scoped: boolean) =>
++    buildHomeSessionRecords({
++      sessions: () => [session],
++      projectDirectories: scoped ? projectDirectories : () => undefined,
++      projects: home.project.list,
++      resolveProject: ctx.projects.forSession,
++    })[0]
++
++  const lookupRecord = async (sessionID: string, signal?: AbortSignal) => {
++    const ctx = home.server.focusedContext()
++
++    if (!ctx) return
++    const result = await lookupHomeSession(ctx, sessionID, signal)
++
++    if (!result) return
++
++    return recordFor(result, ctx, true)
++  }
++
++  const lookupController = new AbortController()
++  onCleanup(() => lookupController.abort())
++
++  // A new connection may have renamed or lost a session a pin already resolved, so ask again.
++  createEffect(
++    on(
++      () => home.server.focusedContext(),
++      (ctx, previous) => {
++        if (!ctx || ctx === previous) return
++
++        resolvedPins.clear()
++        setLookupCache(reconcile({}))
++      },
++      { defer: true },
++    ),
++  )
++
++  // Pinned sessions older than the loaded window are fetched once each. Only a live server that answers the session is
++  // gone drops its pin: no context, a stale run, a timeout or a failed request keep it for the next attempt.
++  createEffect(() => {
++    const ctx = home.server.focusedContext()
++    const server = pinServer()
++    const ids = pinnedIds()
++    const found = known()
++
++    if (!ctx || !server) return
++
++    const gone = ids.filter((id) => ctx.data.session.missing(id))
++
++    if (gone.length > 0) ctx.homePins.prune(gone)
++
++    const missing = untrack(() =>
++      ids.filter((id) => {
++        const key = pinKey({ server, sessionId: id })
++
++        return !found.has(id) && !gone.includes(id) && !lookupCache[key] && !resolvedPins.has(key) && !inflightPins.has(key)
++      }),
++    )
++
++    if (missing.length === 0) return
++    missing.forEach((id) => inflightPins.add(pinKey({ server, sessionId: id })))
++
++    const focusedContext = home.server.focusedContext
++
++    const deadline =
++      "any" in AbortSignal && "timeout" in AbortSignal
++        ? AbortSignal.any([lookupController.signal, AbortSignal.timeout(HOME_SESSIONS_FETCH_TIMEOUT_MS)])
++        : lookupController.signal
++
++    void (async () => {
++      for (const id of missing) {
++        const key = pinKey({ server, sessionId: id })
++
++        await lookupHomeSession(ctx, id, deadline).then(
++          (session) => {
++            inflightPins.delete(key)
++
++            const decision = pinLookupDecision({
++              current: focusedContext() === ctx && pinServer() === server,
++              session,
++            })
++
++            if (decision === "retry") return
++
++            resolvedPins.add(key)
++
++            if (decision === "gone") {
++              ctx.homePins.prune([id])
++
++              return
++            }
++
++            const record = session && recordFor(session, ctx, false)
++
++            if (record) setLookupCache(key, record)
++          },
++          () => inflightPins.delete(key),
++        )
++      }
++    })()
++  })
++
++  // Pins resolve without the project scope, so selecting another project never mistakes an out-of-scope pin for a gone
++  // session. The scope only decides what the list shows.
++  const pinnedRecords = createMemo(() => {
++    const server = pinServer()
++    const ctx = home.server.focusedContext()
++    const directories = projectDirectories()
++    const scope = directories ? new Set(directories.map(pathKey)) : undefined
++
++    if (!server) return []
++
++    return pinnedIds().flatMap((id) => {
++      if (ctx?.data.session.missing(id)) return []
++
++      const record = known().get(id) ?? lookupCache[pinKey({ server, sessionId: id })]
++
++      if (!record) return []
++
++      if (scope && !scope.has(pathKey(record.session.location.directory))) return []
++
++      return [record]
++    })
++  })
++
++  const groups = createMemo(() => groupSessions([...pinnedRecords(), ...records()], language, pinnedIds()))
+   const prefetched = new Set<string>()
+ 
+   const location = (record: HomeSessionRecord) => {
+@@ -484,6 +631,15 @@ export function createHomeSessionsController(home: HomeController) {
+     )
+   }
+ 
++  // Only the inline filter lists a pin the index no longer holds; the flat results panel keeps its own records.
++  const pinnedSearchRecords = createMemo(() => {
++    const records = allRecords()
++    const seen = new Set(records.map((record) => record.session.id))
++    const extra = pinnedRecords().filter((record) => !seen.has(record.session.id))
++
++    return extra.length === 0 ? records : [...extra, ...records]
++  })
++
+   return {
+     copy: {
+       language,
+@@ -494,11 +650,32 @@ export function createHomeSessionsController(home: HomeController) {
+       listView: createMemo(() => selectHomeSessionsListView(load(), groups().length > 0)),
+       loading: () => selectHomeSessionsSearchLoading(load()),
+       retry: () => dispatchLoad({ type: "retry" }),
++      pinnedIds,
++      pinnedSearchRecords,
+       searchRecords: allRecords,
+     },
+     platform: {
+       desktop: platform.platform === "desktop",
+     },
++    pins: {
++      isPinned: (sessionID: string) => {
++        const ctx = home.server.focusedContext()
++
++        if (ctx) return ctx.homePins.isPinned(sessionID)
++        const server = pinServer()
++
++        return server ? global.homePins.isPinned(server, sessionID) : false
++      },
++      toggle: (sessionID: string) => {
++        const server = pinServer()
++
++        if (!server) return
++        const ctx = home.server.focusedContext()
++        const { wasPinned } = ctx ? ctx.homePins.toggle(sessionID) : global.homePins.toggle(server, sessionID)
++
++        if (wasPinned) setLookupCache(pinKey({ server, sessionId: sessionID }), undefined)
++      },
++    },
+     location: {
+       value: location,
+       sync: syncLocations,
+@@ -507,21 +684,7 @@ export function createHomeSessionsController(home: HomeController) {
+       showProjectName: () => !home.project.selected(),
+       server: () => home.selection.value().server,
+       canCreate: () => !!home.project.newSession(),
+-      lookup: async (sessionID: string, signal?: AbortSignal) => {
+-        const ctx = home.server.focusedContext()
+-
+-        if (!ctx) return
+-        const result = await lookupHomeSession(ctx, sessionID, signal)
+-
+-        if (!result) return
+-
+-        return buildHomeSessionRecords({
+-          sessions: () => [result],
+-          projectDirectories,
+-          projects: home.project.list,
+-          resolveProject: ctx.projects.forSession,
+-        })[0]
+-      },
++      lookup: async (sessionID: string, signal?: AbortSignal) => lookupRecord(sessionID, signal),
+       create: home.project.openNewSession,
+       open: (session: SessionInfo, options?: OpenSessionOptions) => {
+         const project = homeProjectForSession(session, home.project.list())
+@@ -613,38 +776,6 @@ export function homeSessionSearchKey(record: HomeSessionRecord) {
+   return `${pathKey(record.session.location.directory)}:${record.session.id}`
+ }
+ 
+-// Calendar day in the local time zone, comparable as a number.
+-function localDay(date: Date) {
+-  return date.getFullYear() * 10_000 + date.getMonth() * 100 + date.getDate()
+-}
+-
+-export function groupSessions(
+-  records: HomeSessionRecord[],
+-  language: ReturnType<typeof useLanguage>,
+-): HomeSessionGroup[] {
+-  const now = new Date()
+-  const today = localDay(now)
+-  const yesterday = localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
+-
+-  const day = (record: HomeSessionRecord) =>
+-    localDay(new Date(record.session.time.updated ?? record.session.time.created))
+-
+-  const todaySessions = records.filter((record) => day(record) === today)
+-  const yesterdaySessions = records.filter((record) => day(record) === yesterday)
+-  const olderSessions = records.filter((record) => day(record) !== today && day(record) !== yesterday)
+-
+-  const olderTitle =
+-    todaySessions.length === 0 && yesterdaySessions.length === 0
+-      ? language.t("sidebar.project.recentSessions")
+-      : language.t("home.sessions.group.older")
+-
+-  return [
+-    { id: "today" as const, title: language.t("home.sessions.group.today"), sessions: todaySessions },
+-    { id: "yesterday" as const, title: language.t("home.sessions.group.yesterday"), sessions: yesterdaySessions },
+-    { id: "older" as const, title: olderTitle, sessions: olderSessions },
+-  ].filter((group) => group.sessions.length > 0)
+-}
+-
+ export type HomeSessionsController = ReturnType<typeof createHomeSessionsController>
+ 
+ export function HomeSessionStatusController(props: {
+diff --git a/packages/app/src/home/sessions/groups.test.ts b/packages/app/src/home/sessions/groups.test.ts
+new file mode 100644
+index 0000000000..e4083523ae
+--- /dev/null
++++ b/packages/app/src/home/sessions/groups.test.ts
+@@ -0,0 +1,52 @@
++import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test"
++import type { SessionInfo } from "@opencode/client/promise"
++import { groupSessions } from "./groups"
++import type { HomeSessionRecord } from "./records"
++
++const language: Parameters<typeof groupSessions>[1] = { t: (key) => key }
++
++const record = (id: string, updated: number): HomeSessionRecord =>
++  // SAFETY: the fixture spells only the fields the grouping reads; the rest of SessionInfo never reaches these tests.
++  ({
++    session: {
++      id,
++      projectID: "p",
++      title: id,
++      time: { created: 1, updated },
++      location: { directory: "/repo" },
++    } as SessionInfo,
++    project: { id: "p", worktree: "/repo" },
++    projectName: "Project",
++  }) as HomeSessionRecord
++
++const at = new Date("2026-11-24T12:00:00")
++
++const now = at.getTime()
++
++describe("groupSessions", () => {
++  beforeEach(() => setSystemTime(at))
++  afterEach(() => setSystemTime())
++
++  test("puts pins first, in pin order, and removes them from date groups", () => {
++    const records = [record("today", now), record("old", now - 3 * 86_400_000), record("pinned", now - 30 * 86_400_000)]
++
++    const groups = groupSessions(records, language, ["pinned", "today"])
++
++    expect(groups.map((group) => group.id)).toEqual(["pinned", "older"])
++    expect(groups[0]?.sessions.map((item) => item.session.id)).toEqual(["pinned", "today"])
++    expect(groups[1]?.sessions.map((item) => item.session.id)).toEqual(["old"])
++  })
++
++  test("omits the pinned group when no pin resolves", () => {
++    const groups = groupSessions([record("today", now)], language, ["gone"])
++
++    expect(groups.map((group) => group.id)).toEqual(["today"])
++  })
++
++  test("keeps a matching pin on top of a filtered list", () => {
++    const groups = groupSessions([record("match", now)], language, ["match"])
++
++    expect(groups.map((group) => group.id)).toEqual(["pinned"])
++    expect(groups[0]?.title).toBe("home.sessions.group.pinned")
++  })
++})
+diff --git a/packages/app/src/home/sessions/groups.ts b/packages/app/src/home/sessions/groups.ts
+new file mode 100644
+index 0000000000..0d27d643ec
+--- /dev/null
++++ b/packages/app/src/home/sessions/groups.ts
+@@ -0,0 +1,67 @@
++import type { HomeSessionRecord } from "./records"
++
++export type HomeSessionGroupId = "pinned" | "today" | "yesterday" | "older"
++
++export type HomeSessionGroup = {
++  id: HomeSessionGroupId
++  title: string
++  sessions: HomeSessionRecord[]
++}
++
++// Calendar day in the local time zone, comparable as a number.
++function localDay(date: Date) {
++  return date.getFullYear() * 10_000 + date.getMonth() * 100 + date.getDate()
++}
++
++type GroupCopy = {
++  t(
++    key:
++      | "home.sessions.group.pinned"
++      | "home.sessions.group.today"
++      | "home.sessions.group.yesterday"
++      | "home.sessions.group.older"
++      | "sidebar.project.recentSessions",
++  ): string
++}
++
++export function groupSessions(
++  records: readonly HomeSessionRecord[],
++  language: GroupCopy,
++  pinned: readonly string[] = [],
++): HomeSessionGroup[] {
++  const now = new Date()
++  const today = localDay(now)
++  const yesterday = localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
++
++  const byId = new Map(records.map((record) => [record.session.id, record]))
++
++  const pinnedRecords = pinned.flatMap((id) => {
++    const record = byId.get(id)
++
++    return record ? [record] : []
++  })
++
++  const pinnedIDs = new Set(pinnedRecords.map((record) => record.session.id))
++  const rest = records.filter((record) => !pinnedIDs.has(record.session.id))
++
++  const day = (record: HomeSessionRecord) =>
++    localDay(new Date(record.session.time.updated ?? record.session.time.created))
++
++  const todaySessions = rest.filter((record) => day(record) === today)
++  const yesterdaySessions = rest.filter((record) => day(record) === yesterday)
++  const olderSessions = rest.filter((record) => day(record) !== today && day(record) !== yesterday)
++
++  const olderTitle =
++    todaySessions.length === 0 && yesterdaySessions.length === 0
++      ? language.t("sidebar.project.recentSessions")
++      : language.t("home.sessions.group.older")
++
++  return [
++    ...(pinnedRecords.length > 0
++      ? [{ id: "pinned" as const, title: language.t("home.sessions.group.pinned"), sessions: pinnedRecords }]
++      : []),
++    { id: "today" as const, title: language.t("home.sessions.group.today"), sessions: todaySessions },
++    { id: "yesterday" as const, title: language.t("home.sessions.group.yesterday"), sessions: yesterdaySessions },
++    { id: "older" as const, title: olderTitle, sessions: olderSessions },
++  ].filter((group) => group.sessions.length > 0)
++}
+diff --git a/packages/app/src/home/sessions/pin-lookup.test.ts b/packages/app/src/home/sessions/pin-lookup.test.ts
+new file mode 100644
+index 0000000000..b94727a071
+--- /dev/null
++++ b/packages/app/src/home/sessions/pin-lookup.test.ts
+@@ -0,0 +1,21 @@
++import { describe, expect, test } from "bun:test"
++import type { SessionInfo } from "@opencode/client/promise"
++import { pinLookupDecision } from "./pin-lookup"
++
++// SAFETY: the decision reads only whether a session is present, never its fields.
++const session = { id: "ses_1" } as SessionInfo
++
++describe("pinLookupDecision", () => {
++  test("resolves a session the live context answered with", () => {
++    expect(pinLookupDecision({ current: true, session })).toBe("resolved")
++  })
++
++  test("drops a pin only when the live context says the session is gone", () => {
++    expect(pinLookupDecision({ current: true, session: undefined })).toBe("gone")
++  })
++
++  test("keeps the pin when the run no longer belongs to the focused server", () => {
++    expect(pinLookupDecision({ current: false, session: undefined })).toBe("retry")
++    expect(pinLookupDecision({ current: false, session })).toBe("retry")
++  })
++})
+diff --git a/packages/app/src/home/sessions/pin-lookup.ts b/packages/app/src/home/sessions/pin-lookup.ts
+new file mode 100644
+index 0000000000..a5b48b8f37
+--- /dev/null
++++ b/packages/app/src/home/sessions/pin-lookup.ts
+@@ -0,0 +1,13 @@
++import type { SessionInfo } from "@opencode/client/promise"
++
++export type PinLookupDecision = "resolved" | "gone" | "retry"
++
++/**
++ * Only a live context that answers the session does not exist drops a pin. No context, a run that no longer matches the
++ * focused server, and a failed request all keep it for a later attempt.
++ */
++export function pinLookupDecision(input: { current: boolean; session: SessionInfo | undefined }): PinLookupDecision {
++  if (!input.current) return "retry"
++
++  return input.session ? "resolved" : "gone"
++}
+diff --git a/packages/app/src/home/sessions/pin-store.ts b/packages/app/src/home/sessions/pin-store.ts
+new file mode 100644
+index 0000000000..e21770fbe2
+--- /dev/null
++++ b/packages/app/src/home/sessions/pin-store.ts
+@@ -0,0 +1,185 @@
++import { ClientError } from "@opencode/client/promise"
++import { Predicate } from "effect"
++import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
++import { Persist, persisted } from "@/runtime/persistence/storage"
++import type { ServerSDK } from "@/runtime/server/client"
++import type { ServerConnection } from "@/runtime/server/registry"
++import { HOME_SESSIONS_FETCH_TIMEOUT_MS } from "./load-machine"
++import {
++  EMPTY_HOME_PINS,
++  HomePinsSchema,
++  isPinned,
++  isServerSynced,
++  markServerSynced,
++  pinsForServer,
++  prunePins,
++  replaceServerPins,
++  togglePin,
++} from "./pins"
++import {
++  INITIAL_HOME_PIN_SYNC_STATE,
++  transitionHomePinSync,
++  type HomePinSyncEffect,
++  type HomePinSyncEvent,
++} from "./pin-sync-machine"
++
++function isUnsupportedPinError(cause: unknown) {
++  if (!(cause instanceof ClientError) || cause.reason !== "UnexpectedStatus") return false
++
++  if (!Predicate.isObject(cause.cause) || !Predicate.hasProperty(cause.cause, "status")) return false
++
++  return cause.cause.status === 404 || cause.cause.status === 405 || cause.cause.status === 501
++}
++
++export function createGlobalHomePins() {
++  const [state, setState, , ready] = persisted(Persist.global("home.pins"), HomePinsSchema, EMPTY_HOME_PINS)
++
++  return {
++    ready,
++    ids: (server: ServerConnection.Key) => pinsForServer(state, server),
++    isPinned: (server: ServerConnection.Key, sessionId: string) => isPinned(state, { server, sessionId }),
++    isSynced: (server: ServerConnection.Key) => isServerSynced(state, server),
++    markSynced: (server: ServerConnection.Key) => setState((current) => markServerSynced(current, server)),
++    replace: (server: ServerConnection.Key, sessionIds: readonly string[], options?: { readonly markSynced?: boolean }) =>
++      setState((current) => replaceServerPins(current, server, sessionIds, options)),
++    toggle: (server: ServerConnection.Key, sessionId: string) => {
++      const ref = { server, sessionId }
++      const wasPinned = isPinned(state, ref)
++
++      setState((current) => togglePin(current, ref))
++
++      return { wasPinned }
++    },
++    prune: (server: ServerConnection.Key, sessionIds: readonly string[]) => {
++      if (sessionIds.length === 0) return
++      setState((current) =>
++        prunePins(current, (item) => item.server === server && sessionIds.includes(item.sessionId)),
++      )
++    },
++  }
++}
++
++export type GlobalHomePins = ReturnType<typeof createGlobalHomePins>
++
++export function createServerHomePins(input: {
++  readonly key: ServerConnection.Key
++  readonly sdk: ServerSDK
++  readonly store: GlobalHomePins
++}) {
++  const [syncState, setSyncState] = createSignal(INITIAL_HOME_PIN_SYNC_STATE)
++  const controllers = new Map<number, AbortController>()
++
++  const dispatch = (event: HomePinSyncEvent) =>
++    untrack(() => {
++      const previous = syncState()
++      const next = transitionHomePinSync(previous, event)
++
++      if (next.state !== previous) setSyncState(next.state)
++      next.effects.forEach(runEffect)
++    })
++
++  function runEffect(effect: HomePinSyncEffect) {
++    if (effect.type === "fetch.cancel" || effect.type === "mutate.cancel") {
++      controllers.get(effect.attempt)?.abort()
++      controllers.delete(effect.attempt)
++
++      return
++    }
++
++    if (effect.type === "mark.synced") {
++      input.store.markSynced(effect.server)
++
++      return
++    }
++
++    if (effect.type === "apply") {
++      input.store.replace(effect.server, effect.pins, { markSynced: effect.markSynced })
++
++      return
++    }
++
++    const attempt = effect.attempt
++    const controller = new AbortController()
++
++    controllers.set(attempt, controller)
++
++    const signal =
++      "any" in AbortSignal && "timeout" in AbortSignal
++        ? AbortSignal.any([controller.signal, AbortSignal.timeout(HOME_SESSIONS_FETCH_TIMEOUT_MS)])
++        : controller.signal
++
++    if (effect.type === "fetch") {
++      void input.sdk.api.server.homePins({ signal }).then(
++        (result) => {
++          controllers.delete(attempt)
++          dispatch({
++            type: "fetch.succeeded",
++            attempt,
++            pins: result.pins,
++            localPins: input.store.ids(effect.server),
++            synced: input.store.isSynced(effect.server),
++          })
++        },
++        (cause: unknown) => {
++          controllers.delete(attempt)
++          dispatch({ type: isUnsupportedPinError(cause) ? "fetch.unsupported" : "fetch.failed", attempt })
++        },
++      )
++
++      return
++    }
++
++    const request =
++      effect.mutation.op === "pin"
++        ? input.sdk.api.server.pinHomeSession({ sessionID: effect.mutation.sessionId }, { signal })
++        : input.sdk.api.server.unpinHomeSession({ sessionID: effect.mutation.sessionId }, { signal })
++
++    void request.then(
++      (result) => {
++        controllers.delete(attempt)
++        dispatch({ type: "mutation.succeeded", attempt, pins: result.pins })
++      },
++      (cause: unknown) => {
++        controllers.delete(attempt)
++        dispatch({ type: isUnsupportedPinError(cause) ? "mutation.unsupported" : "mutation.failed", attempt })
++      },
++    )
++  }
++
++  createEffect(() => {
++    const connected = input.store.ready() && input.sdk.connection.status() === "connected"
++
++    untrack(() => dispatch({ type: "server.changed", server: input.key, connected }))
++  })
++
++  onCleanup(
++    input.sdk.event.on("server.home_pins.updated", (event) => {
++      dispatch({ type: "remote.updated", server: input.key, pins: event.data.pins })
++    }),
++  )
++
++  onCleanup(() => dispatch({ type: "disposed" }))
++
++  const ids = createMemo(() => input.store.ids(input.key))
++
++  return {
++    ids,
++    isPinned: (sessionId: string) => input.store.isPinned(input.key, sessionId),
++    toggle: (sessionId: string) => {
++      const { wasPinned } = input.store.toggle(input.key, sessionId)
++
++      dispatch({ type: "mutation.requested", server: input.key, op: wasPinned ? "unpin" : "pin", sessionId })
++
++      return { wasPinned }
++    },
++    prune: (sessionIds: readonly string[]) => {
++      const present = sessionIds.filter((id) => input.store.isPinned(input.key, id))
++
++      if (present.length === 0) return
++      input.store.prune(input.key, present)
++      present.forEach((sessionId) => dispatch({ type: "mutation.requested", server: input.key, op: "unpin", sessionId }))
++    },
++  }
++}
++
++export type ServerHomePins = ReturnType<typeof createServerHomePins>
+diff --git a/packages/app/src/home/sessions/pin-sync-machine.test.ts b/packages/app/src/home/sessions/pin-sync-machine.test.ts
+new file mode 100644
+index 0000000000..60d482387f
+--- /dev/null
++++ b/packages/app/src/home/sessions/pin-sync-machine.test.ts
+@@ -0,0 +1,149 @@
++import { describe, expect, test } from "bun:test"
++import type { ServerConnection } from "@/runtime/server/registry"
++import {
++  INITIAL_HOME_PIN_SYNC_STATE,
++  transitionHomePinSync,
++  type HomePinSyncEvent,
++  type HomePinSyncState,
++} from "./pin-sync-machine"
++
++// SAFETY: a server key is an opaque branded string; the tests only need distinct values.
++const serverKey = (name: string) => name as ServerConnection.Key
++
++const SERVER_A = serverKey("http:a")
++
++const SERVER_B = serverKey("http:b")
++
++function step(state: HomePinSyncState, event: HomePinSyncEvent) {
++  return transitionHomePinSync(state, event)
++}
++
++describe("home pin sync machine", () => {
++  test("loads pins on connect and applies live remote updates when idle", () => {
++    const loading = step(INITIAL_HOME_PIN_SYNC_STATE, { type: "server.changed", server: SERVER_A, connected: true })
++    expect(loading.state).toMatchObject({ status: "loading", attempt: 1, server: SERVER_A })
++    expect(loading.effects).toEqual([{ type: "fetch", attempt: 1, server: SERVER_A }])
++
++    const ready = step(loading.state, {
++      type: "fetch.succeeded",
++      attempt: 1,
++      pins: ["ses_1"],
++      localPins: [],
++      synced: false,
++    })
++
++    expect(ready.state).toMatchObject({ status: "ready", server: SERVER_A, inFlight: undefined, queue: [] })
++    expect(ready.effects).toEqual([{ type: "apply", server: SERVER_A, pins: ["ses_1"], markSynced: true }])
++
++    const remote = step(ready.state, { type: "remote.updated", server: SERVER_A, pins: ["ses_1", "ses_2"] })
++    expect(remote.state).toBe(ready.state)
++    expect(remote.effects).toEqual([{ type: "apply", server: SERVER_A, pins: ["ses_1", "ses_2"], markSynced: true }])
++  })
++
++  test("migrates pre-existing unsynced local pins once when server is empty, without resurrecting cleared pins", () => {
++    const loading = step(INITIAL_HOME_PIN_SYNC_STATE, { type: "server.changed", server: SERVER_A, connected: true })
++
++    // Unsynced local pins upload sequentially.
++    const migrating = step(loading.state, {
++      type: "fetch.succeeded",
++      attempt: 1,
++      pins: [],
++      localPins: ["ses_a", "ses_b"],
++      synced: false,
++    })
++
++    expect(migrating.effects).toEqual([
++      { type: "mark.synced", server: SERVER_A },
++      { type: "mutate", attempt: 2, server: SERVER_A, mutation: { op: "pin", sessionId: "ses_a" } },
++    ])
++
++    const second = step(migrating.state, { type: "mutation.succeeded", attempt: 2, pins: ["ses_a"] })
++    expect(second.effects).toEqual([
++      { type: "mutate", attempt: 3, server: SERVER_A, mutation: { op: "pin", sessionId: "ses_b" } },
++    ])
++
++    const done = step(second.state, { type: "mutation.succeeded", attempt: 3, pins: ["ses_a", "ses_b"] })
++    expect(done.effects).toEqual([{ type: "apply", server: SERVER_A, pins: ["ses_a", "ses_b"], markSynced: true }])
++
++    // Already-synced client receiving empty server pins clears local cache instead of re-uploading.
++    const disconnected = step(done.state, { type: "server.changed", server: SERVER_A, connected: false })
++    const reloading = step(disconnected.state, { type: "server.changed", server: SERVER_A, connected: true })
++    const attempt = reloading.state.status === "loading" ? reloading.state.attempt : -1
++
++    const cleared = step(reloading.state, {
++      type: "fetch.succeeded",
++      attempt,
++      pins: [],
++      localPins: ["ses_a", "ses_b"],
++      synced: true,
++    })
++
++    expect(cleared.effects).toEqual([{ type: "apply", server: SERVER_A, pins: [], markSynced: true }])
++  })
++
++  test("serializes mutations, coalesces repeated toggles for the same session, and defers SSE while busy", () => {
++    const loading = step(INITIAL_HOME_PIN_SYNC_STATE, { type: "server.changed", server: SERVER_A, connected: true })
++
++    const ready = step(loading.state, {
++      type: "fetch.succeeded",
++      attempt: 1,
++      pins: [],
++      localPins: [],
++      synced: true,
++    })
++
++    const m1 = step(ready.state, { type: "mutation.requested", server: SERVER_A, op: "pin", sessionId: "ses_1" })
++    expect(m1.effects).toEqual([
++      { type: "mutate", attempt: 2, server: SERVER_A, mutation: { op: "pin", sessionId: "ses_1" } },
++    ])
++
++    // While ses_1 is in flight, pin then unpin ses_2 coalesces to a single unpin.
++    const m2 = step(m1.state, { type: "mutation.requested", server: SERVER_A, op: "pin", sessionId: "ses_2" })
++    const m3 = step(m2.state, { type: "mutation.requested", server: SERVER_A, op: "unpin", sessionId: "ses_2" })
++    expect(m3.effects).toEqual([])
++
++    // Remote SSE broadcast is ignored while local mutations are still in flight.
++    const sse = step(m3.state, { type: "remote.updated", server: SERVER_A, pins: ["ses_1"] })
++    expect(sse.effects).toEqual([])
++
++    const after1 = step(m3.state, { type: "mutation.succeeded", attempt: 2, pins: ["ses_1"] })
++    expect(after1.effects).toEqual([
++      { type: "mutate", attempt: 3, server: SERVER_A, mutation: { op: "unpin", sessionId: "ses_2" } },
++    ])
++
++    const after2 = step(after1.state, { type: "mutation.succeeded", attempt: 3, pins: ["ses_1"] })
++    expect(after2.effects).toEqual([{ type: "apply", server: SERVER_A, pins: ["ses_1"], markSynced: true }])
++  })
++
++  test("falls back cleanly on unsupported servers and cancels stale attempts on server switch or dispose", () => {
++    const loadingA = step(INITIAL_HOME_PIN_SYNC_STATE, { type: "server.changed", server: SERVER_A, connected: true })
++    const unsupported = step(loadingA.state, { type: "fetch.unsupported", attempt: 1 })
++    expect(unsupported.state).toMatchObject({ status: "unsupported", server: SERVER_A })
++
++    // Further mutations on an unsupported server are no-ops.
++    const ignored = step(unsupported.state, {
++      type: "mutation.requested",
++      server: SERVER_A,
++      op: "pin",
++      sessionId: "ses_1",
++    })
++
++    expect(ignored.state).toBe(unsupported.state)
++    expect(ignored.effects).toEqual([])
++
++    // Switching to another server fetches fresh pins for the new server.
++    const loadingB = step(unsupported.state, { type: "server.changed", server: SERVER_B, connected: true })
++    expect(loadingB.state).toMatchObject({ status: "loading", attempt: 2, server: SERVER_B })
++    expect(loadingB.effects).toEqual([{ type: "fetch", attempt: 2, server: SERVER_B }])
++
++    // Stale fetch from A is ignored.
++    expect(
++      step(loadingB.state, { type: "fetch.succeeded", attempt: 1, pins: ["stale"], localPins: [], synced: true }).state,
++    ).toBe(loadingB.state)
++
++    // Dispose cancels the in-flight request.
++    const disposed = step(loadingB.state, { type: "disposed" })
++    expect(disposed.state.status).toBe("disposed")
++    expect(disposed.effects).toEqual([{ type: "fetch.cancel", attempt: 2 }])
++  })
++})
+diff --git a/packages/app/src/home/sessions/pin-sync-machine.ts b/packages/app/src/home/sessions/pin-sync-machine.ts
+new file mode 100644
+index 0000000000..fad78363d9
+--- /dev/null
++++ b/packages/app/src/home/sessions/pin-sync-machine.ts
+@@ -0,0 +1,281 @@
++import type { ServerConnection } from "@/runtime/server/registry"
++
++export type HomePinMutation = {
++  readonly op: "pin" | "unpin"
++  readonly sessionId: string
++}
++
++/**
++ * Synchronizes Home session pins with the focused server.
++ *
++ * Local persistence stays the fast cache and fallback for servers that predate the pin endpoints. Once connected to a
++ * supporting server, this machine loads the server's pins, migrates pre-existing local pins once when the server has
++ * none, serializes pin/unpin mutations through one queue, and applies live SSE broadcasts when idle.
++ */
++export type HomePinSyncState =
++  | { readonly status: "idle"; readonly issued: number; readonly server: ServerConnection.Key | undefined }
++  | {
++      readonly status: "loading"
++      readonly issued: number
++      readonly attempt: number
++      readonly server: ServerConnection.Key
++      readonly queue: readonly HomePinMutation[]
++    }
++  | {
++      readonly status: "ready"
++      readonly issued: number
++      readonly server: ServerConnection.Key
++      readonly inFlight: { readonly attempt: number; readonly mutation: HomePinMutation } | undefined
++      readonly queue: readonly HomePinMutation[]
++    }
++  | { readonly status: "unsupported"; readonly issued: number; readonly server: ServerConnection.Key }
++  | { readonly status: "disposed" }
++
++export type HomePinSyncEvent =
++  | { readonly type: "server.changed"; readonly server: ServerConnection.Key | undefined; readonly connected: boolean }
++  | {
++      readonly type: "fetch.succeeded"
++      readonly attempt: number
++      readonly pins: readonly string[]
++      readonly localPins: readonly string[]
++      readonly synced: boolean
++    }
++  | { readonly type: "fetch.unsupported"; readonly attempt: number }
++  | { readonly type: "fetch.failed"; readonly attempt: number }
++  | {
++      readonly type: "mutation.requested"
++      readonly server: ServerConnection.Key
++      readonly op: "pin" | "unpin"
++      readonly sessionId: string
++    }
++  | { readonly type: "mutation.succeeded"; readonly attempt: number; readonly pins: readonly string[] }
++  | { readonly type: "mutation.unsupported"; readonly attempt: number }
++  | { readonly type: "mutation.failed"; readonly attempt: number }
++  | { readonly type: "remote.updated"; readonly server: ServerConnection.Key; readonly pins: readonly string[] }
++  | { readonly type: "disposed" }
++
++export type HomePinSyncEffect =
++  | { readonly type: "fetch.cancel"; readonly attempt: number }
++  | { readonly type: "fetch"; readonly attempt: number; readonly server: ServerConnection.Key }
++  | { readonly type: "mutate.cancel"; readonly attempt: number }
++  | {
++      readonly type: "mutate"
++      readonly attempt: number
++      readonly server: ServerConnection.Key
++      readonly mutation: HomePinMutation
++    }
++  | {
++      readonly type: "apply"
++      readonly server: ServerConnection.Key
++      readonly pins: readonly string[]
++      readonly markSynced: boolean
++    }
++  | { readonly type: "mark.synced"; readonly server: ServerConnection.Key }
++
++export type HomePinSyncTransition = {
++  readonly state: HomePinSyncState
++  readonly effects: readonly HomePinSyncEffect[]
++}
++
++const NONE: readonly HomePinSyncEffect[] = Object.freeze([])
++
++const DISPOSED: HomePinSyncState = Object.freeze({ status: "disposed" })
++
++export const INITIAL_HOME_PIN_SYNC_STATE: HomePinSyncState = Object.freeze({
++  status: "idle",
++  issued: 0,
++  server: undefined,
++})
++
++function unchanged(state: HomePinSyncState): HomePinSyncTransition {
++  return { state, effects: NONE }
++}
++
++function cancelEffects(state: HomePinSyncState): readonly HomePinSyncEffect[] {
++  if (state.status === "loading") return [{ type: "fetch.cancel", attempt: state.attempt }]
++
++  if (state.status === "ready" && state.inFlight) return [{ type: "mutate.cancel", attempt: state.inFlight.attempt }]
++
++  return NONE
++}
++
++function enqueue(queue: readonly HomePinMutation[], mutation: HomePinMutation): readonly HomePinMutation[] {
++  const next = queue.filter((item) => item.sessionId !== mutation.sessionId)
++
++  next.push(mutation)
++
++  return next
++}
++
++function mergeQueue(
++  prefix: readonly HomePinMutation[],
++  suffix: readonly HomePinMutation[],
++): readonly HomePinMutation[] {
++  let result: readonly HomePinMutation[] = []
++
++  for (const item of prefix) result = enqueue(result, item)
++
++  for (const item of suffix) result = enqueue(result, item)
++
++  return result
++}
++
++function startNextMutation(
++  issued: number,
++  server: ServerConnection.Key,
++  queue: readonly HomePinMutation[],
++  leadingEffects: readonly HomePinSyncEffect[] = NONE,
++): HomePinSyncTransition {
++  const [next, ...rest] = queue
++
++  if (!next) {
++    return {
++      state: { status: "ready", issued, server, inFlight: undefined, queue: [] },
++      effects: leadingEffects,
++    }
++  }
++
++  const attempt = issued + 1
++
++  return {
++    state: { status: "ready", issued: attempt, server, inFlight: { attempt, mutation: next }, queue: rest },
++    effects: [...leadingEffects, { type: "mutate", attempt, server, mutation: next }],
++  }
++}
++
++export function transitionHomePinSync(state: HomePinSyncState, event: HomePinSyncEvent): HomePinSyncTransition {
++  if (state.status === "disposed") return unchanged(state)
++
++  if (event.type === "disposed") return { state: DISPOSED, effects: cancelEffects(state) }
++
++  if (event.type === "server.changed") {
++    if (!event.server || !event.connected) {
++      if (state.status === "idle" && state.server === event.server) return unchanged(state)
++
++      if (state.status === "unsupported" && state.server === event.server) return unchanged(state)
++
++      return {
++        state: { status: "idle", issued: state.issued, server: event.server },
++        effects: cancelEffects(state),
++      }
++    }
++
++    if (
++      (state.status === "loading" || state.status === "ready" || state.status === "unsupported") &&
++      state.server === event.server
++    )
++      return unchanged(state)
++
++    const attempt = state.issued + 1
++
++    return {
++      state: { status: "loading", issued: attempt, attempt, server: event.server, queue: [] },
++      effects: [...cancelEffects(state), { type: "fetch", attempt, server: event.server }],
++    }
++  }
++
++  if (event.type === "fetch.succeeded") {
++    if (state.status !== "loading" || state.attempt !== event.attempt) return unchanged(state)
++
++    const shouldMigrate = event.pins.length === 0 && !event.synced && event.localPins.length > 0
++
++    if (shouldMigrate) {
++      const migration: HomePinMutation[] = event.localPins.map((sessionId) => ({ op: "pin", sessionId }))
++      const merged = mergeQueue(migration, state.queue)
++
++      return startNextMutation(state.issued, state.server, merged, [{ type: "mark.synced", server: state.server }])
++    }
++
++    if (state.queue.length > 0) {
++      return startNextMutation(state.issued, state.server, state.queue, [{ type: "mark.synced", server: state.server }])
++    }
++
++    return {
++      state: { status: "ready", issued: state.issued, server: state.server, inFlight: undefined, queue: [] },
++      effects: [{ type: "apply", server: state.server, pins: event.pins, markSynced: true }],
++    }
++  }
++
++  if (event.type === "fetch.unsupported") {
++    if (state.status !== "loading" || state.attempt !== event.attempt) return unchanged(state)
++
++    return {
++      state: { status: "unsupported", issued: state.issued, server: state.server },
++      effects: NONE,
++    }
++  }
++
++  if (event.type === "fetch.failed") {
++    if (state.status !== "loading" || state.attempt !== event.attempt) return unchanged(state)
++
++    return {
++      state: { status: "idle", issued: state.issued, server: state.server },
++      effects: NONE,
++    }
++  }
++
++  if (event.type === "mutation.requested") {
++    const mutation: HomePinMutation = { op: event.op, sessionId: event.sessionId }
++
++    if (state.status === "loading" && state.server === event.server) {
++      return {
++        state: { ...state, queue: enqueue(state.queue, mutation) },
++        effects: NONE,
++      }
++    }
++
++    if (state.status === "ready" && state.server === event.server) {
++      if (!state.inFlight) return startNextMutation(state.issued, state.server, [mutation])
++
++      return {
++        state: { ...state, queue: enqueue(state.queue, mutation) },
++        effects: NONE,
++      }
++    }
++
++    return unchanged(state)
++  }
++
++  if (event.type === "mutation.succeeded") {
++    if (state.status !== "ready" || state.inFlight?.attempt !== event.attempt) return unchanged(state)
++
++    if (state.queue.length > 0) return startNextMutation(state.issued, state.server, state.queue)
++
++    return {
++      state: { ...state, inFlight: undefined },
++      effects: [{ type: "apply", server: state.server, pins: event.pins, markSynced: true }],
++    }
++  }
++
++  if (event.type === "mutation.unsupported") {
++    if (state.status !== "ready" || state.inFlight?.attempt !== event.attempt) return unchanged(state)
++
++    return {
++      state: { status: "unsupported", issued: state.issued, server: state.server },
++      effects: NONE,
++    }
++  }
++
++  if (event.type === "mutation.failed") {
++    if (state.status !== "ready" || state.inFlight?.attempt !== event.attempt) return unchanged(state)
++
++    return startNextMutation(state.issued, state.server, state.queue)
++  }
++
++  if (event.type === "remote.updated") {
++    if (
++      state.status !== "ready" ||
++      state.server !== event.server ||
++      state.inFlight !== undefined ||
++      state.queue.length > 0
++    )
++      return unchanged(state)
++
++    return {
++      state,
++      effects: [{ type: "apply", server: state.server, pins: event.pins, markSynced: true }],
++    }
++  }
++
++  return unchanged(state)
++}
+diff --git a/packages/app/src/home/sessions/pins.test.ts b/packages/app/src/home/sessions/pins.test.ts
+new file mode 100644
+index 0000000000..a3649caa48
+--- /dev/null
++++ b/packages/app/src/home/sessions/pins.test.ts
+@@ -0,0 +1,75 @@
++import { describe, expect, test } from "bun:test"
++import {
++  EMPTY_HOME_PINS,
++  isPinned,
++  isServerSynced,
++  markServerSynced,
++  pin,
++  pinKey,
++  pinsForServer,
++  prunePins,
++  replaceServerPins,
++  togglePin,
++  unpin,
++  type HomePin,
++} from "./pins"
++
++// SAFETY: a server key is an opaque branded string; the tests only need distinct values for it.
++const serverKey = (name: string) => name as HomePin["server"]
++
++const ref = (sessionId: string, server = "local"): HomePin => ({ server: serverKey(server), sessionId })
++
++describe("home pins", () => {
++  test("keys a pin by server and session", () => {
++    expect(pinKey(ref("s1"))).toBe(`local\0s1`)
++    expect(pinKey(ref("s1", "remote"))).not.toBe(pinKey(ref("s1")))
++  })
++
++  test("appends in pin order and ignores a duplicate", () => {
++    const once = pin(pin(EMPTY_HOME_PINS, ref("a")), ref("b"))
++
++    expect(once.pins.map((item) => item.sessionId)).toEqual(["a", "b"])
++    expect(pin(once, ref("a"))).toBe(once)
++    expect(isPinned(once, ref("a"))).toBe(true)
++  })
++
++  test("unpins only the matching server", () => {
++    const state = pin(pin(EMPTY_HOME_PINS, ref("a")), ref("a", "remote"))
++
++    expect(unpin(state, ref("a")).pins.map((item) => String(item.server))).toEqual(["remote"])
++    expect(unpin(state, ref("missing"))).toBe(state)
++  })
++
++  test("toggles on then off", () => {
++    const on = togglePin(EMPTY_HOME_PINS, ref("a"))
++
++    expect(isPinned(on, ref("a"))).toBe(true)
++    expect(isPinned(togglePin(on, ref("a")), ref("a"))).toBe(false)
++  })
++
++  test("prunes only pins the caller reports gone", () => {
++    const state = pin(pin(EMPTY_HOME_PINS, ref("keep")), ref("gone"))
++
++    expect(prunePins(state, (item) => item.sessionId === "gone").pins.map((item) => item.sessionId)).toEqual(["keep"])
++    expect(prunePins(state, () => false)).toBe(state)
++  })
++
++  test("lists one server's pins in pin order", () => {
++    const state = pin(pin(pin(EMPTY_HOME_PINS, ref("a")), ref("b", "remote")), ref("c"))
++
++    expect(pinsForServer(state, "local")).toEqual(["a", "c"])
++    expect(pinsForServer(state, "remote")).toEqual(["b"])
++  })
++
++  test("replaces only one server's pins, deduplicates, and preserves object identity on no-op", () => {
++    const base = pin(pin(EMPTY_HOME_PINS, ref("a")), ref("r1", "remote"))
++    const replaced = replaceServerPins(base, serverKey("local"), ["b", "c", "b"], { markSynced: true })
++
++    expect(pinsForServer(replaced, "local")).toEqual(["b", "c"])
++    expect(pinsForServer(replaced, "remote")).toEqual(["r1"])
++    expect(isServerSynced(replaced, serverKey("local"))).toBe(true)
++    expect(isServerSynced(replaced, serverKey("remote"))).toBe(false)
++    expect(replaceServerPins(replaced, serverKey("local"), ["b", "c"], { markSynced: true })).toBe(replaced)
++    expect(markServerSynced(replaced, serverKey("local"))).toBe(replaced)
++  })
++})
+diff --git a/packages/app/src/home/sessions/pins.ts b/packages/app/src/home/sessions/pins.ts
+new file mode 100644
+index 0000000000..11fecb0ccc
+--- /dev/null
++++ b/packages/app/src/home/sessions/pins.ts
+@@ -0,0 +1,98 @@
++import { Schema } from "effect"
++import { Persistence } from "@/runtime/persistence/schema"
++import { ServerKey } from "@/runtime/server/persistence"
++
++/**
++ * Pinned Home sessions: references only. The session list resolves them against the loaded index and looks up the ones
++ * it no longer holds, so a pin never carries a stale title.
++ */
++export const HomePinsSchema = Persistence.struct({
++  pins: Persistence.array(
++    Persistence.struct({
++      server: ServerKey,
++      sessionId: Schema.String,
++    }),
++  ),
++  /** Servers that have already synced pins at least once; prevents re-uploading cleared pins. */
++  synced: Persistence.array(ServerKey),
++})
++
++export type HomePinsState = typeof HomePinsSchema.Type
++
++export type HomePin = HomePinsState["pins"][number]
++
++export const EMPTY_HOME_PINS: HomePinsState = { pins: [], synced: [] }
++
++export const pinKey = (pin: HomePin) => `${pin.server}\0${pin.sessionId}`
++
++const same = (a: HomePin, b: HomePin) => a.server === b.server && a.sessionId === b.sessionId
++
++export function isPinned(state: HomePinsState, pin: HomePin) {
++  return state.pins.some((item) => same(item, pin))
++}
++
++export function isServerSynced(state: HomePinsState, server: HomePin["server"]) {
++  return state.synced.includes(server)
++}
++
++export function markServerSynced(state: HomePinsState, server: HomePin["server"]): HomePinsState {
++  if (state.synced.includes(server)) return state
++
++  return { ...state, synced: [...state.synced, server] }
++}
++
++export function pin(state: HomePinsState, entry: HomePin): HomePinsState {
++  if (isPinned(state, entry)) return state
++
++  return { ...state, pins: [...state.pins, entry] }
++}
++
++export function unpin(state: HomePinsState, entry: HomePin): HomePinsState {
++  const pins = state.pins.filter((item) => !same(item, entry))
++
++  return pins.length === state.pins.length ? state : { ...state, pins }
++}
++
++export function togglePin(state: HomePinsState, entry: HomePin): HomePinsState {
++  return isPinned(state, entry) ? unpin(state, entry) : pin(state, entry)
++}
++
++export function prunePins(state: HomePinsState, gone: (pin: HomePin) => boolean): HomePinsState {
++  const pins = state.pins.filter((item) => !gone(item))
++
++  return pins.length === state.pins.length ? state : { ...state, pins }
++}
++
++export function pinsForServer(state: HomePinsState, server: string) {
++  return state.pins.filter((item) => item.server === server).map((item) => item.sessionId)
++}
++
++export function replaceServerPins(
++  state: HomePinsState,
++  server: HomePin["server"],
++  sessionIds: readonly string[],
++  options?: { readonly markSynced?: boolean },
++): HomePinsState {
++  const deduped: string[] = []
++  const seen = new Set<string>()
++
++  for (const id of sessionIds) {
++    if (!id || seen.has(id)) continue
++    seen.add(id)
++    deduped.push(id)
++  }
++
++  const current = pinsForServer(state, server)
++  const pinsUnchanged = current.length === deduped.length && current.every((id, index) => id === deduped[index])
++  const shouldSync = options?.markSynced === true && !state.synced.includes(server)
++
++  if (pinsUnchanged && !shouldSync) return state
++
++  const nextPins = pinsUnchanged
++    ? state.pins
++    : [...state.pins.filter((item) => item.server !== server), ...deduped.map((sessionId) => ({ server, sessionId }))]
++
++  const nextSynced = shouldSync ? [...state.synced, server] : state.synced
++
++  return { pins: nextPins, synced: nextSynced }
++}
+diff --git a/packages/app/src/home/sessions/region.tsx b/packages/app/src/home/sessions/region.tsx
+index 4b26280e37..13e386c46e 100644
+--- a/packages/app/src/home/sessions/region.tsx
++++ b/packages/app/src/home/sessions/region.tsx
+@@ -35,6 +35,8 @@ export function HomeSessions(props: {
+           searchNoResultsLabel={props.search.result.noResultsLabel()}
+           titleOpacity={props.scroll.header.titleOpacity}
+           isOpenTab={props.sessions.tab.isOpen}
++          isPinned={props.sessions.pins.isPinned}
++          onTogglePin={props.sessions.pins.toggle}
+           onCreateSession={props.sessions.session.create}
+           onOpenSession={props.sessions.session.open}
+           onArchiveSession={props.sessions.session.archive}
+diff --git a/packages/app/src/home/sessions/search.ts b/packages/app/src/home/sessions/search.ts
+index 3f5e0a40a0..1be703d8f4 100644
+--- a/packages/app/src/home/sessions/search.ts
++++ b/packages/app/src/home/sessions/search.ts
+@@ -7,11 +7,11 @@ import { makeEventListener } from "@solid-primitives/event-listener"
+ import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+ import type { HomeController } from "../model"
+ import {
+-  groupSessions,
+   homeSessionSearchKey,
+   type HomeSessionRecord,
+   type HomeSessionsController,
+ } from "./controller"
++import { groupSessions } from "./groups"
+ import {
+   INITIAL_HOME_SESSION_SEARCH_STATE,
+   selectSearchExact,
+@@ -85,8 +85,7 @@ export function createHomeSessionSearchController(
+ 
+     if (!value) return []
+ 
+-    const records = sessions.data
+-      .searchRecords()
++    const records = (inline() ? sessions.data.pinnedSearchRecords() : sessions.data.searchRecords())
+       .filter((record) => `${sessionLabel(record.session)} ${record.projectName}`.toLowerCase().includes(value))
+ 
+     const exact = selectSearchExact(searchState())
+@@ -106,7 +105,9 @@ export function createHomeSessionSearchController(
+ 
+   const open = createMemo(() => !inline() && selectSearchOpen(searchState()))
+ 
+-  const groups = createMemo(() => (inline() && query() ? groupSessions(results(), language) : sessions.data.groups()))
++  const groups = createMemo(() =>
++    inline() && query() ? groupSessions(results(), language, sessions.data.pinnedIds()) : sessions.data.groups(),
++  )
+ 
+   const placeholder = createMemo(() => {
+     const project = home.project.selected()
+diff --git a/packages/app/src/home/sessions/view.css b/packages/app/src/home/sessions/view.css
+index 82d374355d..d02a4fbc42 100644
+--- a/packages/app/src/home/sessions/view.css
++++ b/packages/app/src/home/sessions/view.css
+@@ -94,6 +94,8 @@
+ /* Keyboard focus scrolls a row clear of the sticky search and date header above it (68/84/108px plus 28px). */
+ [data-component="home-session-row"] {
+   scroll-margin-top: 100px;
++  -webkit-touch-callout: none;
++  user-select: none;
+ 
+   @media (width >= 48rem) {
+     scroll-margin-top: 116px;
+diff --git a/packages/app/src/home/sessions/view.tsx b/packages/app/src/home/sessions/view.tsx
+index 08b6d18aec..c1d2791b1a 100644
+--- a/packages/app/src/home/sessions/view.tsx
++++ b/packages/app/src/home/sessions/view.tsx
+@@ -36,10 +36,10 @@ import "./view.css"
+ import {
+   HomeSessionStatusController,
+   homeSessionSearchKey,
+-  type HomeSessionGroup,
+   type HomeSessionRecord,
+   type OpenSessionOptions,
+ } from "./controller"
++import type { HomeSessionGroup } from "./groups"
+ import type { HomeSessionsFailure, HomeSessionsListView, HomeSessionsUnavailableReason } from "./load-machine"
+ import {
+   INITIAL_HOME_SESSION_ROW_STATE,
+@@ -100,6 +100,8 @@ export type HomeSessionsViewProps = {
+   searchNoResultsLabel: string
+   titleOpacity: (id: HomeSessionGroup["id"]) => number
+   isOpenTab: (record: HomeSessionRecord) => boolean
++  isPinned: (sessionID: string) => boolean
++  onTogglePin: (sessionID: string) => void
+   onCreateSession: () => void
+   onRetry: () => void
+   onOpenSession: (session: SessionInfo, options?: OpenSessionOptions) => void
+@@ -331,6 +333,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
+                 {(group, index) => (
+                   <>
+                     <HomeSessionGroupHeader
++                      id={group().id}
+                       title={group().title}
+                       titleOpacity={props.titleOpacity(group().id)}
+                       onSetRef={(element) => props.onSetHeader(group().id, element)}
+@@ -674,6 +677,7 @@ function HomeSessionSearchResultRow(
+ }
+ 
+ function HomeSessionGroupHeader(props: {
++  id: HomeSessionGroup["id"]
+   title: string
+   titleOpacity: number
+   onSetRef: (element: HTMLDivElement) => void
+@@ -688,6 +692,8 @@ function HomeSessionGroupHeader(props: {
+   return (
+     <div
+       ref={element}
++      data-component="home-session-group"
++      data-group-id={props.id}
+       class={`
+         pointer-events-none sticky top-[68px] flex h-7 min-w-0 items-center justify-between
+         bg-v2-background-bg-base ps-1.5 md:ps-3 md:top-[84px] lg:top-[108px]
+@@ -863,6 +869,9 @@ function HomeSessionRow(
+           }}
+         >
+           <HomeSessionIndicators server={props.server} isOpenTab={props.isOpenTab} record={props.record} />
++          <Show when={props.isPinned(sessionID())}>
++            <Icon name="pin" class="shrink-0 text-v2-icon-icon-muted" aria-hidden="true" />
++          </Show>
+           <div
+             data-slot="home-session-labels"
+             class="min-w-0 flex-1 items-center gap-1.5"
+@@ -884,6 +893,26 @@ function HomeSessionRow(
+             />
+           </div>
+         </button>
++        <IconButton
++          type="button"
++          data-action="home-session-options"
++          variant="ghost-muted"
++          size="large"
++          class="me-1 shrink-0 md:hidden"
++          icon={<Icon name="outline-dots" />}
++          aria-label={props.language.t("common.moreOptions")}
++          aria-haspopup="menu"
++          aria-expanded={!!menu()}
++          onPointerDown={(event) => event.stopPropagation()}
++          onClick={(event) => {
++            event.stopPropagation()
++            const container = event.currentTarget.closest<HTMLElement>('[data-component="home-session-row-container"]')
++
++            if (!container) return
++            const bounds = event.currentTarget.getBoundingClientRect()
++            openMenu(container, bounds.left, bounds.bottom)
++          }}
++        />
+       </Show>
+       <Menu
+         modal={false}
+@@ -917,6 +946,9 @@ function HomeSessionRow(
+             <Menu.Item onSelect={() => props.onOpenSession(props.record.session, { background: true })}>
+               {props.language.t("home.sessions.openInBackground")}
+             </Menu.Item>
++            <Menu.Item onSelect={() => props.onTogglePin(sessionID())}>
++              {props.language.t(props.isPinned(sessionID()) ? "home.sessions.unpin" : "home.sessions.pin")}
++            </Menu.Item>
+             <Menu.Separator />
+             <Menu.Item
+               onSelect={() => props.onRowEvent({ type: "rename.start", sessionID: sessionID(), title: title() })}
+diff --git a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en.ts
+index 9bb4444706..3c124830fe 100644
+--- a/packages/app/src/runtime/i18n/en.ts
++++ b/packages/app/src/runtime/i18n/en.ts
+@@ -618,12 +618,15 @@ export const dict = {
+   "home.sessions.search.sessions": "Sessions",
+   "home.sessions.search.noResults": "No sessions found for {{query}}",
+   "home.sessions.openInBackground": "Open in background",
++  "home.sessions.pin": "Pin",
++  "home.sessions.unpin": "Unpin",
+   "home.sessions.empty": "Nothing here yet",
+   "home.sessions.empty.description": "Create a session to get started",
+   "home.sessions.load.failed": "Couldn't load sessions",
+   "home.sessions.load.timeout": "The server took too long to answer",
+   "home.sessions.group.today": "Today",
+   "home.sessions.group.yesterday": "Yesterday",
++  "home.sessions.group.pinned": "Pinned",
+   "home.sessions.group.older": "Older",
+   "home.providerTip": "Connect to 75+ providers to use other models, including Claude, GPT, Gemini, etc",
+   "tips.browse.title": "Control your browser",
+diff --git a/packages/app/src/runtime/i18n/ja.ts b/packages/app/src/runtime/i18n/ja.ts
+index 1b1810d60f..d83e3bcf24 100644
+--- a/packages/app/src/runtime/i18n/ja.ts
++++ b/packages/app/src/runtime/i18n/ja.ts
+@@ -323,6 +323,9 @@ export const dict = {
+   "home.sessions.group.today": "今日",
+   "home.sessions.group.yesterday": "昨日",
+   "home.sessions.group.older": "それ以前",
++  "home.sessions.group.pinned": "ピン留め",
++  "home.sessions.pin": "ピン留め",
++  "home.sessions.unpin": "ピン留めを解除",
+   "home.providerTip": "75以上のプロバイダーに接続して、Claude、GPT、Geminiなどの他のモデルを利用できます",
+   "session.tab.session": "セッション",
+   "session.tab.unknown": "不明なセッション",
+diff --git a/packages/app/src/runtime/server/runtime.tsx b/packages/app/src/runtime/server/runtime.tsx
+index 832a67739b..55c8a66474 100644
+--- a/packages/app/src/runtime/server/runtime.tsx
++++ b/packages/app/src/runtime/server/runtime.tsx
+@@ -34,6 +34,7 @@ import { createServerNotificationState } from "@/shell/notifications/notificatio
+ import { createNotificationCoordinator } from "@/shell/notifications/coordinator"
+ import { useCurrentRoute } from "@/shell/state/layout"
+ import { createSessionPreferences } from "@/shell/state/session-preferences"
++import { createGlobalHomePins, createServerHomePins, type GlobalHomePins } from "@/home/sessions/pin-store"
+ import { useTabs } from "@/shell/tabs/tabs"
+ import { Persist, persisted } from "@/runtime/persistence/storage"
+ import { createDesktopData } from "./data"
+@@ -54,6 +55,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
+     const server = useServers()
+     const models = createGlobalModels()
+     const sessionPreferences = createSessionPreferences()
++    const homePins = createGlobalHomePins()
+     const notificationCoordinator = createNotificationCoordinator()
+     const owner = getOwner()
+ 
+@@ -82,6 +84,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
+                 server.projects.forServer(effect.key),
+                 notificationCoordinator,
+                 sessionPreferences,
++                homePins,
+               ),
+               dispose,
+             }),
+@@ -128,6 +131,7 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
+       },
+       models,
+       sessionPreferences,
++      homePins,
+       /** Runs each keyed sound and system notification once across windows; notifications only while none has focus. */
+       notifications: notificationCoordinator,
+       /** The live controller of a server, or undefined while it is unlisted or rejects our credentials. Reactive. */
+@@ -203,6 +207,7 @@ function createServerController(
+   projects: ReturnType<typeof createServerProjects>,
+   notificationCoordinator: ReturnType<typeof createNotificationCoordinator>,
+   sessionPreferences: ReturnType<typeof createSessionPreferences>,
++  globalHomePins: GlobalHomePins,
+ ) {
+   const language = useLanguage()
+   const settings = useSettings()
+@@ -259,7 +264,13 @@ function createServerController(
+ 
+   const sync = createServerSyncContext(sdk, data)
+   const autoApprove = createPermissionAutoApprover({ sdk, data })
+-  onCleanup(data.on("session.deleted", (event) => sessionPreferences.forget(connKey, event.data.sessionID)))
++  const homePins = createServerHomePins({ key: connKey, sdk, store: globalHomePins })
++  onCleanup(
++    data.on("session.deleted", (event) => {
++      sessionPreferences.forget(connKey, event.data.sessionID)
++      homePins.prune([event.data.sessionID])
++    }),
++  )
+ 
+   const notification = createServerNotificationState({
+     sdk,
+@@ -379,6 +390,7 @@ function createServerController(
+     notification,
+     autoApprove,
+     handoff,
++    homePins,
+   }
+ }
+ 
+diff --git a/packages/app/src/session/screen.tsx b/packages/app/src/session/screen.tsx
+index fa9b866dce..f777da22f3 100644
+--- a/packages/app/src/session/screen.tsx
++++ b/packages/app/src/session/screen.tsx
+@@ -389,7 +389,7 @@ function SessionScreenContent(props: {
+       <Show when={!isDesktop() && !!session.identity.params.id && mobileView() === "session"}>
+         <div
+           data-slot="session-location-bar"
+-          class="flex h-9 shrink-0 items-center border-b border-v2-border-border-base px-2"
++          class="flex h-9 shrink-0 items-center gap-1 border-b border-v2-border-border-base px-2"
+         >
+           <SessionLocation
+             project={location.project()}
+@@ -402,6 +402,27 @@ function SessionScreenContent(props: {
+               screen: props.screen,
+             }}
+           />
++          <Show when={!session.data.info()?.parentID && session.identity.params.id} keyed>
++            {(id) => {
++              const pinned = () => server.ctx.homePins.isPinned(id)
++
++              return (
++                <IconButton
++                  type="button"
++                  data-action="mobile-session-pin"
++                  variant="ghost-muted"
++                  size="large"
++                  class="ms-auto shrink-0"
++                  aria-label={language.t(pinned() ? "home.sessions.unpin" : "home.sessions.pin")}
++                  aria-pressed={pinned()}
++                  icon={
++                    <Icon name="pin" class={pinned() ? "text-v2-text-text-base" : "text-v2-icon-icon-muted"} />
++                  }
++                  onClick={() => server.ctx.homePins.toggle(id)}
++                />
++              )
++            }}
++          </Show>
+         </div>
+       </Show>
+       {/* Surface query errors without suspending session metadata while messages load. */}
+diff --git a/packages/app/src/session/timeline/controller.tsx b/packages/app/src/session/timeline/controller.tsx
+index 362221abaf..d5d11f3627 100644
+--- a/packages/app/src/session/timeline/controller.tsx
++++ b/packages/app/src/session/timeline/controller.tsx
+@@ -452,6 +452,10 @@ export function createTimelineController(input: {
+         }),
+     },
+     action: {
++      isPinned: (id: string) => server.ctx.homePins.isPinned(id),
++      togglePin: (id: string) => {
++        server.ctx.homePins.toggle(id)
++      },
+       export: (id: string) => exporter.export({ server: server.key, sessionID: id }),
+       exporting: (id: string) => exporter.exporting({ server: server.key, sessionID: id }),
+       showDelete: (id: string) => dialog.show(() => <DeleteDialog sessionID={id} />),
+diff --git a/packages/app/src/session/timeline/message-timeline.tsx b/packages/app/src/session/timeline/message-timeline.tsx
+index 3ff58a0cd8..c4697788fc 100644
+--- a/packages/app/src/session/timeline/message-timeline.tsx
++++ b/packages/app/src/session/timeline/message-timeline.tsx
+@@ -740,6 +740,9 @@ function MessageTimelineView(
+                           props.title.menuClosed()
+                         }}
+                       >
++                        <Menu.Item onSelect={() => props.action.togglePin(id)}>
++                          {language.t(props.action.isPinned(id) ? "home.sessions.unpin" : "home.sessions.pin")}
++                        </Menu.Item>
+                         <Menu.Item onSelect={props.title.chooseRename}>{language.t("common.rename")}</Menu.Item>
+                         <Menu.Item disabled={props.action.exporting(id)} onSelect={() => props.action.export(id)}>
+                           {language.t("common.export")}…
+diff --git a/packages/client/src/effect/api/api.ts b/packages/client/src/effect/api/api.ts
+index cf8105b9b6..4e1e5e723f 100644
+--- a/packages/client/src/effect/api/api.ts
++++ b/packages/client/src/effect/api/api.ts
+@@ -64,10 +64,28 @@ export type ServerConnectInput = { readonly code: string }
+ export type ServerConnectOutput = { readonly token: string }
+ export type ServerConnectOperation<E = never> = (input: ServerConnectInput) => Effect.Effect<ServerConnectOutput, E>
+ 
++export type ServerHomePinsOutput = { readonly pins: ReadonlyArray<string> }
++export type ServerHomePinsOperation<E = never> = () => Effect.Effect<ServerHomePinsOutput, E>
++
++export type ServerPinHomeSessionInput = { readonly sessionID: string }
++export type ServerPinHomeSessionOutput = { readonly pins: ReadonlyArray<string> }
++export type ServerPinHomeSessionOperation<E = never> = (
++  input: ServerPinHomeSessionInput,
++) => Effect.Effect<ServerPinHomeSessionOutput, E>
++
++export type ServerUnpinHomeSessionInput = { readonly sessionID: string }
++export type ServerUnpinHomeSessionOutput = { readonly pins: ReadonlyArray<string> }
++export type ServerUnpinHomeSessionOperation<E = never> = (
++  input: ServerUnpinHomeSessionInput,
++) => Effect.Effect<ServerUnpinHomeSessionOutput, E>
++
+ export interface ServerApi<E = never> {
+   readonly info: ServerInfoOperation<E>
+   readonly pair: ServerPairOperation<E>
+   readonly connect: ServerConnectOperation<E>
++  readonly homePins: ServerHomePinsOperation<E>
++  readonly pinHomeSession: ServerPinHomeSessionOperation<E>
++  readonly unpinHomeSession: ServerUnpinHomeSessionOperation<E>
+ }
+ 
+ export type LocationGetInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
+@@ -2195,6 +2213,7 @@ export type EventSubscribeInput = {
+         | "mcp.status.changed"
+         | "mcp.resources.changed"
+         | "experimental.mcp.event"
++        | "server.home_pins.updated"
+         | `${"rpc."}${string}`
+       >
+     | undefined
+diff --git a/packages/client/src/effect/generated/client.ts b/packages/client/src/effect/generated/client.ts
+index 8317175296..c2462ea2d8 100644
+--- a/packages/client/src/effect/generated/client.ts
++++ b/packages/client/src/effect/generated/client.ts
+@@ -9,6 +9,11 @@ import type {
+   ServerPairOutput,
+   ServerConnectInput,
+   ServerConnectOutput,
++  ServerHomePinsOutput,
++  ServerPinHomeSessionInput,
++  ServerPinHomeSessionOutput,
++  ServerUnpinHomeSessionInput,
++  ServerUnpinHomeSessionOutput,
+   LocationGetInput,
+   LocationGetOutput,
+   LocationReloadOutput,
+@@ -369,10 +374,26 @@ const EndpointServerConnect = (raw: RawClient["server.server"]) => (input: Serve
+     raw["server.connect"]({ params: { code: input["code"] } }).pipe(Effect.mapError(mapClientError)),
+   )
+ 
++const EndpointServerHomePins = (raw: RawClient["server.server"]) => () =>
++  preserveEffect<ServerHomePinsOutput>()(raw["server.homePins"]({}).pipe(Effect.mapError(mapClientError)))
++
++const EndpointServerPinHomeSession = (raw: RawClient["server.server"]) => (input: ServerPinHomeSessionInput) =>
++  preserveEffect<ServerPinHomeSessionOutput>()(
++    raw["server.pinHomeSession"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
++  )
++
++const EndpointServerUnpinHomeSession = (raw: RawClient["server.server"]) => (input: ServerUnpinHomeSessionInput) =>
++  preserveEffect<ServerUnpinHomeSessionOutput>()(
++    raw["server.unpinHomeSession"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
++  )
++
+ const adaptGroupServer = (raw: RawClient["server.server"]) => ({
+   info: EndpointServerInfo(raw),
+   pair: EndpointServerPair(raw),
+   connect: EndpointServerConnect(raw),
++  homePins: EndpointServerHomePins(raw),
++  pinHomeSession: EndpointServerPinHomeSession(raw),
++  unpinHomeSession: EndpointServerUnpinHomeSession(raw),
+ })
+ 
+ const EndpointLocationGet = (raw: RawClient["server.location"]) => (input?: LocationGetInput) =>
+diff --git a/packages/client/src/promise/generated/client.ts b/packages/client/src/promise/generated/client.ts
+index af220c87ee..0561ba1f55 100644
+--- a/packages/client/src/promise/generated/client.ts
++++ b/packages/client/src/promise/generated/client.ts
+@@ -3,6 +3,11 @@ import type {
+   ServerPairOutput,
+   ServerConnectInput,
+   ServerConnectOutput,
++  ServerHomePinsOutput,
++  ServerPinHomeSessionInput,
++  ServerPinHomeSessionOutput,
++  ServerUnpinHomeSessionInput,
++  ServerUnpinHomeSessionOutput,
+   LocationGetInput,
+   LocationGetOutput,
+   LocationReloadOutput,
+@@ -508,6 +513,33 @@ export function make(options: ClientOptions) {
+           },
+           requestOptions,
+         ),
++      homePins: (requestOptions?: RequestOptions) =>
++        request<ServerHomePinsOutput>(
++          { method: "GET", path: `/api/home/pins`, successStatus: 200, declaredStatuses: [400, 401], empty: false },
++          requestOptions,
++        ),
++      pinHomeSession: (input: ServerPinHomeSessionInput, requestOptions?: RequestOptions) =>
++        request<ServerPinHomeSessionOutput>(
++          {
++            method: "PUT",
++            path: `/api/home/pins/${encodeURIComponent(input.sessionID)}`,
++            successStatus: 200,
++            declaredStatuses: [400, 401],
++            empty: false,
++          },
++          requestOptions,
++        ),
++      unpinHomeSession: (input: ServerUnpinHomeSessionInput, requestOptions?: RequestOptions) =>
++        request<ServerUnpinHomeSessionOutput>(
++          {
++            method: "DELETE",
++            path: `/api/home/pins/${encodeURIComponent(input.sessionID)}`,
++            successStatus: 200,
++            declaredStatuses: [400, 401],
++            empty: false,
++          },
++          requestOptions,
++        ),
+     },
+     location: {
+       get: (input?: LocationGetInput, requestOptions?: RequestOptions) =>
+diff --git a/packages/client/src/promise/generated/types.ts b/packages/client/src/promise/generated/types.ts
+index c3b0724cbe..e867845cdb 100644
+--- a/packages/client/src/promise/generated/types.ts
++++ b/packages/client/src/promise/generated/types.ts
+@@ -13,6 +13,8 @@ export type PairingCode = { code: string; expires_in: number }
+ 
+ export type PairingSession = { token: string }
+ 
++export type HomePins = { pins: Array<string> }
++
+ export type AbsolutePath = string
+ 
+ export type ProjectID = string
+@@ -2204,6 +2206,15 @@ export type ExperimentalMcpEvent = {
+   }
+ }
+ 
++export type ServerHomePinsUpdated = {
++  id: EventID
++  created: number
++  metadata?: { [x: string]: any }
++  type: "server.home_pins.updated"
++  location?: LocationRef
++  data: { pins: Array<string> }
++}
++
+ export type SessionToolSuccess = {
+   id: EventID
+   created: number
+@@ -3083,6 +3094,7 @@ export type V2Event =
+   | McpStatusChanged
+   | McpResourcesChanged
+   | ExperimentalMcpEvent
++  | ServerHomePinsUpdated
+   | V2EventRpc
+   | V2EventServerConnected
+ 
+@@ -3436,6 +3448,16 @@ export type ServerConnectInput = { readonly code: string }
+ 
+ export type ServerConnectOutput = PairingSession
+ 
++export type ServerHomePinsOutput = HomePins
++
++export type ServerPinHomeSessionInput = { readonly sessionID: string }
++
++export type ServerPinHomeSessionOutput = HomePins
++
++export type ServerUnpinHomeSessionInput = { readonly sessionID: string }
++
++export type ServerUnpinHomeSessionOutput = HomePins
++
+ export type LocationGetInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
+ 
+ export type LocationGetOutput = LocationPublicInfo
+@@ -4627,6 +4649,7 @@ export type EventSubscribeInput = {
+         | "mcp.status.changed"
+         | "mcp.resources.changed"
+         | "experimental.mcp.event"
++        | "server.home_pins.updated"
+         | `${"rpc."}${string}`
+       >
+     | undefined
+diff --git a/packages/gui-plugins/src/updater/main.ts b/packages/gui-plugins/src/updater/main.ts
+index eb5a358a48..66ba99808b 100644
+--- a/packages/gui-plugins/src/updater/main.ts
++++ b/packages/gui-plugins/src/updater/main.ts
+@@ -1,5 +1,3 @@
+-import { existsSync } from "node:fs"
+-import { join } from "node:path"
+ import { dialog } from "electron"
+ import { Effect, Exit, Schema, Scope } from "effect"
+ import { builtinMainContext } from "@opencode/plugin/gui/builtin"
+@@ -12,15 +10,15 @@ const setup: Plugin.MainSetup = async (ctx) => {
+   const builtin = builtinMainContext(ctx)
+   const build = ctx.app
+   const lifecycle = builtin.lifecycle
+-  // electron-updater reads its feed from app-update.yml. Distro packages that update the app themselves (such as the
+-  // AUR's opencode-desktop-bin) delete it, and every check would then fail.
+-  const enabled = build.packaged && existsSync(join(process.resourcesPath, "app-update.yml"))
++  // This is a locally built desktop app. The official update feed would download the released app over it and drop the
++  // features this build carries, so automatic updates stay off.
++  const enabled = false
+   // Holds no resources, so it needs no cleanup.
+   const context = logContext(ctx.log.write)
+   const runPromise = Effect.runPromiseWith(context)
+   const runFork = Effect.runForkWith(context)
+ 
+-  if (build.packaged && !enabled) runFork(Effect.logInfo("auto updater disabled, app-update.yml is missing"))
++  if (build.packaged) runFork(Effect.logInfo("automatic updates are disabled in this build"))
+ 
+   // The update main staged for the next start; stored before in the updater's settings file.
+   const ready = builtin.storage.store("ready", {
+diff --git a/packages/plugin/src/gui/icon-name.ts b/packages/plugin/src/gui/icon-name.ts
+index 3c5cf7335c..7f25f85ec8 100644
+--- a/packages/plugin/src/gui/icon-name.ts
++++ b/packages/plugin/src/gui/icon-name.ts
+@@ -129,6 +129,7 @@ export type AppIconName =
+   | "outline-xmark"
+   | "pencil-line"
+   | "photo"
++  | "pin"
+   | "plus"
+   | "plus-small"
+   | "post-skill"
+diff --git a/packages/protocol/src/groups/server.ts b/packages/protocol/src/groups/server.ts
+index d78813bfc8..a7d0d8d50a 100644
+--- a/packages/protocol/src/groups/server.ts
++++ b/packages/protocol/src/groups/server.ts
+@@ -32,6 +32,11 @@ export const PairingSession = Schema.Struct({
+ }).annotate({ identifier: "PairingSession" })
+ export type PairingSession = typeof PairingSession.Type
+ 
++export const HomePins = Schema.Struct({
++  pins: Schema.Array(Schema.String),
++}).annotate({ identifier: "HomePins" })
++export type HomePins = typeof HomePins.Type
++
+ export const PAIRING_CONNECT_PATH = "/auth/connect/:code"
+ 
+ const PAIRING_CONNECT_URL = /^\/auth\/connect\/[^/]+$/
+@@ -77,4 +82,39 @@ export const ServerGroup = HttpApiGroup.make("server.server")
+       }),
+     ),
+   )
++  .add(
++    HttpApiEndpoint.get("server.homePins", "/api/home/pins", {
++      success: HomePins,
++    }).annotateMerge(
++      OpenApi.annotations({
++        identifier: "server.homePins",
++        summary: "List pinned Home sessions",
++        description: "Return the ordered list of pinned Home session IDs stored on this server.",
++      }),
++    ),
++  )
++  .add(
++    HttpApiEndpoint.put("server.pinHomeSession", "/api/home/pins/:sessionID", {
++      params: { sessionID: Schema.String },
++      success: HomePins,
++    }).annotateMerge(
++      OpenApi.annotations({
++        identifier: "server.pinHomeSession",
++        summary: "Pin a Home session",
++        description: "Append a session ID to the server's pinned Home sessions if it is not already pinned.",
++      }),
++    ),
++  )
++  .add(
++    HttpApiEndpoint.delete("server.unpinHomeSession", "/api/home/pins/:sessionID", {
++      params: { sessionID: Schema.String },
++      success: HomePins,
++    }).annotateMerge(
++      OpenApi.annotations({
++        identifier: "server.unpinHomeSession",
++        summary: "Unpin a Home session",
++        description: "Remove a session ID from the server's pinned Home sessions.",
++      }),
++    ),
++  )
+   .annotateMerge(OpenApi.annotations({ title: "server" }))
+diff --git a/packages/schema/src/event-manifest.ts b/packages/schema/src/event-manifest.ts
+index 562c65aeed..3af8a564f1 100644
+--- a/packages/schema/src/event-manifest.ts
++++ b/packages/schema/src/event-manifest.ts
+@@ -82,6 +82,7 @@ export const ServerDefinitions = Event.inventory(
+   McpEvent.StatusChanged,
+   McpEvent.ResourcesChanged,
+   McpEvent.ExperimentalEvent,
++  ServerEvent.HomePinsUpdated,
+ )
+ export const Server = Event.latest(ServerDefinitions)
+ export type ServerEvent = Schema.Schema.Type<(typeof ServerDefinitions)[number]>
+diff --git a/packages/schema/src/server-event.ts b/packages/schema/src/server-event.ts
+index 4f4963cfbf..5ee21e3578 100644
+--- a/packages/schema/src/server-event.ts
++++ b/packages/schema/src/server-event.ts
+@@ -1,8 +1,13 @@
+ export * as ServerEvent from "./server-event.js"
+ 
++import { Schema } from "effect"
+ import { Event } from "./event.js"
+ 
+ export const Connected = Event.ephemeral({ type: "server.connected", schema: {} })
+ export const Disposed = Event.ephemeral({ type: "global.disposed", schema: {} })
++export const HomePinsUpdated = Event.ephemeral({
++  type: "server.home_pins.updated",
++  schema: { pins: Schema.Array(Schema.String) },
++})
+ 
+-export const Definitions = Event.inventory(Connected, Disposed)
++export const Definitions = Event.inventory(Connected, Disposed, HomePinsUpdated)
+diff --git a/packages/server/src/handlers/server.ts b/packages/server/src/handlers/server.ts
+index 7487581e70..64357834b9 100644
+--- a/packages/server/src/handlers/server.ts
++++ b/packages/server/src/handlers/server.ts
+@@ -1,18 +1,40 @@
+ import { hostname } from "node:os"
+-import { Duration, Effect } from "effect"
++import { Duration, Effect, Semaphore } from "effect"
+ import { HttpServerRequest, HttpServerResponse } from "effect/http"
+ import { HttpApiBuilder } from "effect/http-api"
++import { Bus } from "@opencode/core/bus"
++import { KV } from "@opencode/core/kv"
+ import { PersistentPty } from "@opencode/core/persistent-pty"
+ import { UnauthorizedError } from "@opencode/protocol/errors"
++import { ServerEvent } from "@opencode/schema/server-event"
+ import { Api } from "../api"
+ import { ServerAuth } from "../auth"
+ import { ServerInfo } from "../server-info"
+ import { ServerPairing } from "../pairing"
+ 
++const HOME_PINS_KV_KEY = "home.pins"
++
++function decodeHomePins(value: unknown): string[] {
++  if (!Array.isArray(value)) return []
++  const seen = new Set<string>()
++  const pins: string[] = []
++  for (const item of value) {
++    if (typeof item !== "string" || !item || seen.has(item)) continue
++    seen.add(item)
++    pins.push(item)
++  }
++  return pins
++}
++
+ export const ServerHandler = HttpApiBuilder.group(Api, "server.server", (handlers) =>
+   Effect.gen(function* () {
+     const pairing = yield* ServerPairing.Service
+     const auth = yield* ServerAuth.Config
++    const kv = yield* KV.Service
++    const bus = yield* Bus.Service
++    const pinsLock = Semaphore.makeUnsafe(1)
++
++    const readHomePins = () => kv.get(HOME_PINS_KV_KEY).pipe(Effect.map(decodeHomePins))
+ 
+     return handlers
+       .handle("server.info", () =>
+@@ -54,5 +76,38 @@ export const ServerHandler = HttpApiBuilder.group(Api, "server.server", (handler
+           )
+         }),
+       )
++      .handle("server.homePins", () => pinsLock.withPermit(readHomePins().pipe(Effect.map((pins) => ({ pins })))))
++      .handle(
++        "server.pinHomeSession",
++        Effect.fn(function* (ctx) {
++          const sessionID = ctx.params.sessionID
++          return yield* pinsLock.withPermit(
++            Effect.gen(function* () {
++              const current = yield* readHomePins()
++              if (!sessionID || current.includes(sessionID)) return { pins: current }
++              const next = [...current, sessionID]
++              yield* kv.set(HOME_PINS_KV_KEY, next)
++              yield* bus.publish(ServerEvent.HomePinsUpdated, { pins: next })
++              return { pins: next }
++            }),
++          )
++        }),
++      )
++      .handle(
++        "server.unpinHomeSession",
++        Effect.fn(function* (ctx) {
++          const sessionID = ctx.params.sessionID
++          return yield* pinsLock.withPermit(
++            Effect.gen(function* () {
++              const current = yield* readHomePins()
++              const next = current.filter((item) => item !== sessionID)
++              if (next.length === current.length) return { pins: current }
++              yield* kv.set(HOME_PINS_KV_KEY, next)
++              yield* bus.publish(ServerEvent.HomePinsUpdated, { pins: next })
++              return { pins: next }
++            }),
++          )
++        }),
++      )
+   }),
+ )
+diff --git a/packages/server/test/home-pins.test.ts b/packages/server/test/home-pins.test.ts
+new file mode 100644
+index 0000000000..08e535e078
+--- /dev/null
++++ b/packages/server/test/home-pins.test.ts
+@@ -0,0 +1,100 @@
++import { expect } from "bun:test"
++import path from "node:path"
++import { Effect } from "effect"
++import { tmpdir } from "../../core/test/fixture/tmpdir"
++import { it } from "../../core/test/lib/effect"
++import { ServerFetch } from "../src/fetch"
++
++const baseOptions = {
++  app: { version: "test-version" },
++  config: { project: false },
++  models: { fetch: false },
++  fs: { filewatcher: false },
++} as const
++
++it.live("persists Home session pins in server KV across restarts and streams updates", () =>
++  Effect.gen(function* () {
++    const dir = yield* Effect.acquireDisposable(Effect.promise(() => tmpdir("opencode-home-pins-")))
++    const dbPath = path.join(dir.path, "opencode.db")
++    const options = { ...baseOptions, database: { path: dbPath }, config: { directory: dir.path } }
++
++    const first = yield* ServerFetch.make(options)
++
++    const initial = yield* Effect.promise(() => first(new Request("http://opencode.local/api/home/pins")))
++    expect(initial.status).toBe(200)
++    expect(yield* Effect.promise(() => initial.json())).toEqual({ pins: [] })
++
++    // Subscribe to the event stream so we observe live pin broadcasts.
++    const streamController = new AbortController()
++    const streamResponse = yield* Effect.promise(() =>
++      first(
++        new Request("http://opencode.local/api/event?types=server.home_pins.updated", {
++          signal: streamController.signal,
++        }),
++      ),
++    )
++    expect(streamResponse.status).toBe(200)
++    const reader = streamResponse.body!.getReader()
++    const decoder = new TextDecoder()
++
++    const readNextEvent = async () => {
++      let buffer = ""
++      while (true) {
++        const chunk = await reader.read()
++        if (chunk.done) throw new Error("SSE stream closed unexpectedly")
++        buffer += decoder.decode(chunk.value, { stream: true })
++        const split = buffer.indexOf("\n\n")
++        if (split < 0) continue
++        const frame = buffer.slice(0, split)
++        const line = frame.split("\n").find((item) => item.startsWith("data: "))
++        if (line) return JSON.parse(line.slice("data: ".length)) as { type: string; data: unknown }
++        buffer = buffer.slice(split + 2)
++      }
++    }
++
++    expect((yield* Effect.promise(readNextEvent)).type).toBe("server.connected")
++
++    const pinnedA = yield* Effect.promise(() =>
++      first(new Request("http://opencode.local/api/home/pins/ses_a", { method: "PUT" })),
++    )
++    expect(pinnedA.status).toBe(200)
++    expect(yield* Effect.promise(() => pinnedA.json())).toEqual({ pins: ["ses_a"] })
++    expect(yield* Effect.promise(readNextEvent)).toMatchObject({
++      type: "server.home_pins.updated",
++      data: { pins: ["ses_a"] },
++    })
++
++    // Pinning an already-pinned session is idempotent and keeps pin order.
++    const pinnedADup = yield* Effect.promise(() =>
++      first(new Request("http://opencode.local/api/home/pins/ses_a", { method: "PUT" })),
++    )
++    expect(yield* Effect.promise(() => pinnedADup.json())).toEqual({ pins: ["ses_a"] })
++
++    const pinnedB = yield* Effect.promise(() =>
++      first(new Request("http://opencode.local/api/home/pins/ses_b", { method: "PUT" })),
++    )
++    expect(yield* Effect.promise(() => pinnedB.json())).toEqual({ pins: ["ses_a", "ses_b"] })
++    expect(yield* Effect.promise(readNextEvent)).toMatchObject({
++      type: "server.home_pins.updated",
++      data: { pins: ["ses_a", "ses_b"] },
++    })
++
++    const unpinnedA = yield* Effect.promise(() =>
++      first(new Request("http://opencode.local/api/home/pins/ses_a", { method: "DELETE" })),
++    )
++    expect(yield* Effect.promise(() => unpinnedA.json())).toEqual({ pins: ["ses_b"] })
++    expect(yield* Effect.promise(readNextEvent)).toMatchObject({
++      type: "server.home_pins.updated",
++      data: { pins: ["ses_b"] },
++    })
++
++    streamController.abort()
++    yield* Effect.promise(() => reader.cancel().catch(() => undefined))
++
++    // A fresh server reading the same SQLite database preserves the stored pins.
++    const second = yield* ServerFetch.make(options)
++    const afterRestart = yield* Effect.promise(() => second(new Request("http://opencode.local/api/home/pins")))
++    expect(afterRestart.status).toBe(200)
++    expect(yield* Effect.promise(() => afterRestart.json())).toEqual({ pins: ["ses_b"] })
++  }),
++)
+diff --git a/packages/ui/src/icons/catalog.ts b/packages/ui/src/icons/catalog.ts
+index d5ef22e626..05b119f71f 100644
+--- a/packages/ui/src/icons/catalog.ts
++++ b/packages/ui/src/icons/catalog.ts
+@@ -17,6 +17,10 @@ const icons = {
+     viewBox: "0 0 16 16",
+     body: `<g transform="rotate(90 8 8)"><path d="M8 12.5V3.5M11.5 7L8 3.5L4.5 7" stroke-linecap="round" stroke-linejoin="round" stroke="currentColor"/></g>`,
+   },
++  pin: {
++    viewBox: "0 0 16 16",
++    body: `<path d="M5.5 2.5h5M8 2.5v4.2l2.8 2.2v1.4H5.2V8.9L8 6.7V2.5M8 10.3v3.2" stroke-linecap="round" stroke-linejoin="round" stroke="currentColor"/>`,
++  },
+   archive: {
+     viewBox: "0 0 16 16",
+     body: `<path d="M2.5 5.5V13.5H13.5V5.5M2.5 5.5H1.5V2.5H14.5V5.5H13.5M2.5 5.5H13.5M6.5 7.5H9.5" stroke-linecap="round" stroke-linejoin="round" stroke="currentColor"/>`,
